@@ -152,8 +152,8 @@ wrote each finding as a failing test (`tests/review_d1/`). Seven defects, all fi
 | An e-mail with NUL or another control character decoded, then could never be stored | `c1f5ed1` |
 | A `correlation_id` other than the payload's `order_id` decoded | `bf15f1a` |
 
-Its mutation pass left 17 non-equivalent survivors in `messages.py`, `topology.py` and `migrate.py`; each now has a
-test, and each mutant was re-applied and fails it (`2d43faa`, `dcdd337`). Its suspicions (a self-caused message,
+Its mutation pass listed the non-equivalent survivors in `messages.py`, `topology.py` and `migrate.py` (22 mutants as
+re-applied here); each now has a test, and each mutant was re-applied and fails it (`2d43faa`, `dcdd337`). Its suspicions (a self-caused message,
 `publish` on a channel that only logs returns, `lsof | grep -q` under `pipefail`, a test that could leak an exchange)
 were settled in `3c83729`. What held: no input made `decode` raise anything but `InvalidMessage`; the round trip held
 for years 1 to 9999; the routing, the confirmed mandatory publish and both delivery-limit claims; the history checks

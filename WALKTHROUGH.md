@@ -127,7 +127,7 @@ server into a failure.
 **How do you know the tests can fail?**
 For the checks that matter most I removed the code and ran the tests: without the advisory lock the four-migrator test
 fails; comparing only names (not SHA-256) fails the edited-history test; without the open-log-file proof in
-`rabbitmq.sh` the stranger-pid test fails. The review's mutation pass then found 17 changes nothing caught; each has a
+`rabbitmq.sh` the stranger-pid test fails. The review's mutation pass then found 22 changes nothing caught; each has a
 test now and fails it.
 
 ## The services (skeleton)
@@ -160,7 +160,8 @@ PostgreSQL script reported success after a failed statement (`set -e` ignores th
 control characters in e-mails, a correlation id that wasn't the order.
 
 **And the mutation pass?**
-It changed one thing at a time in the three core modules and found 17 changes no test noticed: boundaries
+It changed one thing at a time in the three core modules and listed the changes no test noticed (22 mutants as I
+re-applied them): boundaries
 (`MAX_CENTS`, 254 characters, a zero refund), spellings (uppercase in a UUID's last group, five fractional digits),
 the queue arguments, exchange types, whitespace-only edits to a migration. Each has a test now, and I re-applied each
 mutant to see it fail.
