@@ -15,8 +15,9 @@ from aio_pika.abc import AbstractChannel, ExchangeType
 
 from orderly.messages import PAYLOADS
 
-# A message redelivered this many times (a consumer that keeps crashing on it, or keeps requeueing it) is
-# dead-lettered instead of cycling forever. Retries a handler means to make go through the wait queues (day 3).
+# A message whose consumer died this many times more (it crashed, or its connection closed, before acknowledging) is
+# dead-lettered instead of cycling forever. A requeue doesn't count (RabbitMQ 4 calls it released, DESIGN.md
+# "RabbitMQ topology"), so handlers never requeue: retries go through the wait queues (day 3).
 DELIVERY_LIMIT = 10
 
 
@@ -104,6 +105,16 @@ class Topology:
             "x-overflow": "reject-publish",
         }
 
+    def dead_letter_queue_arguments(self) -> dict[str, aio_pika.abc.FieldValue]:
+        return {
+            "x-queue-type": "quorum",
+            # The last stop: nothing may remove a message from here but an acknowledgement. Quorum queues have a
+            # delivery limit of 20 by default on RabbitMQ 4, and with no dead-letter exchange behind this queue a
+            # message whose consumer died 21 times (an inspector crashing on it) was dropped (day-1 review). -1 means
+            # no limit.
+            "x-delivery-limit": -1,
+        }
+
     async def declare(self, channel: AbstractChannel) -> None:
         """Declare everything. Safe to run again; fails if something exists with different settings."""
         exchanges = {
@@ -113,7 +124,7 @@ class Topology:
         dead_letters = await channel.declare_exchange(self.dead_letters, ExchangeType.DIRECT, durable=True)
         for spec in QUEUES:
             dlq = await channel.declare_queue(
-                self.dead_letter_queue(spec.name), durable=True, arguments={"x-queue-type": "quorum"}
+                self.dead_letter_queue(spec.name), durable=True, arguments=self.dead_letter_queue_arguments()
             )
             await dlq.bind(dead_letters, routing_key=self.dead_letter_queue(spec.name))
             queue = await channel.declare_queue(

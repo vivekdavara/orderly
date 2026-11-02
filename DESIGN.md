@@ -208,7 +208,9 @@ Declared by one module (`orderly.topology`) at every service start, so the broke
   - `notification.order-events` ← `orderly.events` with `order.confirmed`, `order.cancelled`
 - Each queue has a dead-letter queue `<queue>.dlq` (through the `orderly.dlx` direct exchange), where a message goes
   when it is rejected without requeue (undecodable, or out of retries) or exceeds the delivery limit (10). Dead-lettering
-  is at-least-once (`x-dead-letter-strategy`), so a message isn't lost on its way to the dead-letter queue.
+  is at-least-once (`x-dead-letter-strategy`), so a message isn't lost on its way to the dead-letter queue. The
+  dead-letter queues have no delivery limit (`-1`): RabbitMQ 4's default of 20, with nothing behind a dead-letter queue,
+  would drop a message whose inspector crashed on it 21 times.
 - **What the delivery limit counts** (measured on RabbitMQ 4.3, pinned by tests): a delivery that fails because its
   consumer died with it unacknowledged (channel or connection closed) counts; the 11th such delivery is dead-lettered
   with reason `delivery_limit`. A `basic.nack` or `basic.reject` with `requeue=true` does **not** count: RabbitMQ 4
