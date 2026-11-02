@@ -79,6 +79,11 @@ Each service owns its database and nothing else reads it; data another service n
 notification service gets the e-mail address and total in the event, it doesn't look them up). Ports: 8112-8114 for
 the services, RabbitMQ on 5673 (one node), PostgreSQL 14 on 5432 with one database per service.
 
+Every service starts the same way (`orderly.service`, day 1): it migrates its own database, declares the whole
+topology, and opens its connection pool; if any of that fails it doesn't start, so a service never runs against a
+schema or a broker it doesn't expect. `/health` answers 200 only while its database answers (within 2 s) at the
+migration this code expects and its broker connection is up, and 503 naming each problem otherwise.
+
 ## Orchestration or choreography
 
 There are two ways to run a saga:
@@ -310,7 +315,7 @@ data synthetic; every number with the command that produced it.
 
 | Day | Delivers |
 |---|---|
-| 1 | This design, the repo, local RabbitMQ and PostgreSQL scripts, the message contracts, the topology, the migrations, CI with service containers |
+| 1 | This design, the repo, local RabbitMQ and PostgreSQL scripts, the message contracts (and their JSON Schema), the topology, the migrations, the service skeleton (startup, `/health`), CI with service containers |
 | 2 | The monolith, the order service extracted from it, events through RabbitMQ, the transactional outbox |
 | 3 | The payment and notification services, the saga with compensations, idempotent consumers, dead letters, retries with backoff |
 | 4 | Contract tests, failure injection (broker down, duplicates), the 10,000-order load test |
