@@ -27,6 +27,7 @@ from pydantic import (
     StrictInt,
     ValidationError,
     WithJsonSchema,
+    model_validator,
 )
 
 VERSION = 1
@@ -95,18 +96,20 @@ Email = Annotated[
 
 
 class Payload(BaseModel):
-    """A message's body. Subclasses set TYPE (the routing key) and KIND."""
+    """A message's body. Subclasses set TYPE (the routing key) and KIND. Every message belongs to one order's saga, so
+    every payload starts with its order_id (the message's correlation_id)."""
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     TYPE: ClassVar[str]
     KIND: ClassVar[Literal["command", "event"]]
 
+    order_id: CanonicalUUID
+
 
 class ChargePayment(Payload):
     TYPE = "payment.charge"
     KIND = "command"
-    order_id: CanonicalUUID
     customer_id: CustomerId
     amount_cents: PositiveCents
     currency: Currency
@@ -115,7 +118,6 @@ class ChargePayment(Payload):
 class RefundPayment(Payload):
     TYPE = "payment.refund"
     KIND = "command"
-    order_id: CanonicalUUID
     # The amount the order asked to be charged. A refund can arrive before its charge (DESIGN.md "The saga"); the
     # payment service then records the payment as voided, for this amount, and never charges it.
     amount_cents: PositiveCents
@@ -127,7 +129,6 @@ class RefundPayment(Payload):
 class PaymentSucceeded(Payload):
     TYPE = "payment.succeeded"
     KIND = "event"
-    order_id: CanonicalUUID
     payment_id: CanonicalUUID
     amount_cents: PositiveCents
     currency: Currency
@@ -136,7 +137,6 @@ class PaymentSucceeded(Payload):
 class PaymentFailed(Payload):
     TYPE = "payment.failed"
     KIND = "event"
-    order_id: CanonicalUUID
     # declined: the provider said no; voided: a refund for this order came first, so it is never charged.
     reason: Literal["declined", "voided"]
 
@@ -144,7 +144,6 @@ class PaymentFailed(Payload):
 class PaymentRefunded(Payload):
     TYPE = "payment.refunded"
     KIND = "event"
-    order_id: CanonicalUUID
     payment_id: CanonicalUUID
     # 0 when nothing had been charged (the refund voided the payment, or the charge was declined).
     amount_cents: Cents
@@ -154,7 +153,6 @@ class PaymentRefunded(Payload):
 class OrderConfirmed(Payload):
     TYPE = "order.confirmed"
     KIND = "event"
-    order_id: CanonicalUUID
     customer_id: CustomerId
     email: Email
     total_cents: PositiveCents
@@ -164,7 +162,6 @@ class OrderConfirmed(Payload):
 class OrderCancelled(Payload):
     TYPE = "order.cancelled"
     KIND = "event"
-    order_id: CanonicalUUID
     customer_id: CustomerId
     email: Email
     reason: Literal["payment_declined", "payment_timeout"]
@@ -213,6 +210,14 @@ class Message(BaseModel):
     causation_id: CanonicalUUID | None
     payload: AnyPayload
 
+    @model_validator(mode="after")
+    def _correlation_is_the_order(self) -> Message:
+        if self.correlation_id != self.payload.order_id:
+            raise ValueError(
+                f"correlation_id {self.correlation_id} must be the payload's order_id {self.payload.order_id}"
+            )
+        return self
+
     @property
     def type(self) -> str:
         return self.payload.TYPE
@@ -225,17 +230,18 @@ class Message(BaseModel):
 def new_message(
     payload: AnyPayload,
     *,
-    correlation_id: uuid.UUID,
+    correlation_id: uuid.UUID | None = None,
     causation_id: uuid.UUID | None = None,
     occurred_at: datetime | None = None,
     message_id: uuid.UUID | None = None,
 ) -> Message:
-    """A new message with a fresh id, stamped now (to the microsecond) unless told otherwise."""
+    """A new message with a fresh id, stamped now (to the microsecond) unless told otherwise. Its correlation_id is
+    its payload's order_id; passing another is an error."""
     when = datetime.now(UTC) if occurred_at is None else occurred_at
     return Message(
         message_id=uuid.uuid4() if message_id is None else message_id,
         occurred_at=_utc_micros(when),
-        correlation_id=correlation_id,
+        correlation_id=payload.order_id if correlation_id is None else correlation_id,
         causation_id=causation_id,
         payload=payload,
     )
@@ -305,13 +311,16 @@ def decode(body: bytes) -> Message:
         payload = model.model_validate(envelope.payload)
     except ValidationError as error:
         raise InvalidMessage(_describe(error, f"{envelope.type} payload")) from None
-    return Message(
-        message_id=envelope.message_id,
-        occurred_at=envelope.occurred_at,
-        correlation_id=envelope.correlation_id,
-        causation_id=envelope.causation_id,
-        payload=cast(AnyPayload, payload),
-    )
+    try:
+        return Message(
+            message_id=envelope.message_id,
+            occurred_at=envelope.occurred_at,
+            correlation_id=envelope.correlation_id,
+            causation_id=envelope.causation_id,
+            payload=cast(AnyPayload, payload),
+        )
+    except ValidationError as error:
+        raise InvalidMessage(_describe(error, "envelope")) from None
 
 
 def json_schema() -> dict[str, Any]:
@@ -319,7 +328,8 @@ def json_schema() -> dict[str, Any]:
 
     It describes the shape for other tools and languages; `decode` stays the authority and is stricter than a schema
     can say: it also refuses duplicate keys, impossible dates (February 30), 2599.0 as an amount (JSON Schema calls
-    that an integer) and a newline before the end of a pattern-checked string (which Python's `re` lets `$` match).
+    that an integer), a newline before the end of a pattern-checked string (which Python's `re` lets `$` match), and a
+    correlation_id other than the payload's order_id.
     """
     uuid_schema = {"type": "string", "pattern": f"^{_UUID_PATTERN}$"}
     variants = []

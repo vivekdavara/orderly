@@ -206,11 +206,10 @@ payloads: st.SearchStrategy[AnyPayload] = st.one_of(
     ),
 )
 messages = st.builds(
-    lambda payload, correlation, causation, when, message_id: new_message(
-        payload, correlation_id=correlation, causation_id=causation, occurred_at=when, message_id=message_id
+    lambda payload, causation, when, message_id: new_message(
+        payload, causation_id=causation, occurred_at=when, message_id=message_id
     ),
     payloads,
-    uuids,
     st.none() | uuids,
     st.datetimes(timezones=st.just(UTC)),
     uuids,
@@ -297,9 +296,16 @@ def test_the_schema_refuses_what_it_can_express(body: bytes) -> None:
         wire(occurred_at="2026-02-30T20:15:03.123456Z"),
         wire(**{"payload.amount_cents": 2599.0}),
         wire(**{"payload.currency": "USD\n"}),
+        wire(correlation_id=str(MESSAGE)),
     ],
 )
 def test_the_decoder_is_stricter_than_the_schema_where_its_docstring_says(body: bytes) -> None:
     assert Draft202012Validator(json_schema()).is_valid(json.loads(body))
     with pytest.raises(InvalidMessage):
         decode(body)
+
+
+def test_a_new_message_is_correlated_with_its_order() -> None:
+    assert new_message(charge().payload).correlation_id == ORDER
+    with pytest.raises(ValueError, match="must be the payload's order_id"):
+        new_message(charge().payload, correlation_id=MESSAGE)
