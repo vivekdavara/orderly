@@ -45,4 +45,4 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "ASYNC"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src", "tests"]
+files = ["src", "tests", "scripts"]

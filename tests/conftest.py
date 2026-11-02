@@ -85,8 +85,9 @@ def test_database() -> str:
 def fresh_database(test_database: str) -> Iterator[str]:
     """A URL whose connections see an empty database: a new schema, first on their search_path, dropped afterwards.
 
-    A schema rather than a database because PostgreSQL 14's CREATE DATABASE forces a checkpoint: 174-993 ms here
-    against about 1 ms for CREATE SCHEMA.
+    A schema rather than a database because PostgreSQL 14's CREATE DATABASE copies template1 and forces a checkpoint:
+    `scripts/measure_test_fixture.py` measured 36-198 ms per database against 0.1-0.6 ms per schema (5 runs each, load
+    average 3.7); the same statements took 174-993 ms per database while a video render loaded the machine.
     """
     schema = f"t_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(test_database, autocommit=True) as conn:
