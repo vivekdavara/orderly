@@ -173,7 +173,13 @@ positive = st.integers(1, MAX_CENTS)
 currencies = st.sampled_from(["USD", "EUR", "INR", "JPY"])
 payloads: st.SearchStrategy[AnyPayload] = st.one_of(
     st.builds(ChargePayment, order_id=uuids, customer_id=customer_ids, amount_cents=positive, currency=currencies),
-    st.builds(RefundPayment, order_id=uuids, reason=st.sampled_from(["payment_timeout", "order_cancelled"])),
+    st.builds(
+        RefundPayment,
+        order_id=uuids,
+        amount_cents=positive,
+        currency=currencies,
+        reason=st.sampled_from(["payment_timeout", "order_cancelled"]),
+    ),
     st.builds(PaymentSucceeded, order_id=uuids, payment_id=uuids, amount_cents=positive, currency=currencies),
     st.builds(PaymentFailed, order_id=uuids, reason=st.sampled_from(["declined", "voided"])),
     st.builds(

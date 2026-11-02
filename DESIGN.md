@@ -140,7 +140,7 @@ The payment service is the other half of the timeout rule. It keeps one row per 
 
 | Payment row | `payment.charge` | `payment.refund` |
 |---|---|---|
-| none | charge; `succeeded` or `failed` | record `voided`; `refunded` (nothing charged) |
+| none | charge; `succeeded` or `failed` | record `voided` for the refund's amount; `refunded` (0 charged) |
 | charged | reply `succeeded` again (same payment) | refund through the provider; `refunded` |
 | declined | reply `failed` again | nothing to refund; `refunded` (amount 0) |
 | refunded / voided | reply `failed` (`voided`), never charge | reply `refunded` again |
@@ -181,7 +181,7 @@ ids for tools and logs.
 | Type | Kind | From → to | Payload |
 |---|---|---|---|
 | `payment.charge` | command | order → payment | order_id, customer_id, amount_cents, currency |
-| `payment.refund` | command | order → payment | order_id, reason |
+| `payment.refund` | command | order → payment | order_id, amount_cents, currency, reason |
 | `payment.succeeded` | event | payment → order | order_id, payment_id, amount_cents, currency |
 | `payment.failed` | event | payment → order | order_id, reason |
 | `payment.refunded` | event | payment → order | order_id, payment_id, amount_cents, currency |

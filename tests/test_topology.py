@@ -28,7 +28,7 @@ ONE_OF_EACH: list[Message] = [
     new_message(payload, correlation_id=ORDER)
     for payload in (
         ChargePayment(order_id=ORDER, customer_id="c-1", amount_cents=500, currency="USD"),
-        RefundPayment(order_id=ORDER, reason="payment_timeout"),
+        RefundPayment(order_id=ORDER, amount_cents=500, currency="USD", reason="payment_timeout"),
         PaymentSucceeded(order_id=ORDER, payment_id=PAYMENT, amount_cents=500, currency="USD"),
         PaymentFailed(order_id=ORDER, reason="declined"),
         PaymentRefunded(order_id=ORDER, payment_id=PAYMENT, amount_cents=0, currency="USD"),

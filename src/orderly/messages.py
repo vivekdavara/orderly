@@ -95,6 +95,10 @@ class RefundPayment(Payload):
     TYPE = "payment.refund"
     KIND = "command"
     order_id: CanonicalUUID
+    # The amount the order asked to be charged. A refund can arrive before its charge (DESIGN.md "The saga"); the
+    # payment service then records the payment as voided, for this amount, and never charges it.
+    amount_cents: PositiveCents
+    currency: Currency
     # payment_timeout: the order gave up waiting; order_cancelled: a success arrived after it did.
     reason: Literal["payment_timeout", "order_cancelled"]
 
