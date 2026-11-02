@@ -45,11 +45,12 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `docs/message-schema.json` | The same contract as a JSON Schema, generated from the code (`scripts/export_message_schema.py`) and checked by tests |
 | `src/orderly/topology.py` | Exchanges, quorum queues, dead-letter queues and bindings as code; `routes()` says where each type goes |
 | `src/orderly/broker.py` | Persistent, mandatory, confirmed publishing on a channel where a returned message is an error |
+| `src/orderly/service.py` | The skeleton every service shares: migrate and declare at startup, `/health` (200 only with its database, schema and broker right), ports 8112-8114 |
 | `src/orderly/migrate.py`, `src/orderly/migrations/` | Numbered SQL migrations per service, applied in one transaction under an advisory lock; edited history refused |
 | `scripts/rabbitmq.sh` | A local RabbitMQ node on 127.0.0.1:5673, kept apart from any other RabbitMQ on the machine |
 | `scripts/postgres.sh` | Creates, migrates, lists and drops Orderly's databases on the local PostgreSQL 14 (`ORDERLY_PG_PREFIX` renames them) |
 | `scripts/measure_test_fixture.py` | Times CREATE DATABASE against CREATE SCHEMA (why each test gets a schema) |
-| `tests/` | 162 tests: unit, property and integration tests against the real servers |
+| `tests/` | 171 tests: unit, property and integration tests against the real servers |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
 ## Run it
@@ -61,6 +62,13 @@ make venv              # .venv with the package and its dev tools
 make services-up       # scripts/rabbitmq.sh start + scripts/postgres.sh create (databases, migrations)
 make check             # ruff, ruff format --check, mypy --strict, pytest
 make services-down     # stop the RabbitMQ node (the databases stay)
+```
+
+Run a service (it migrates its database and declares the topology first):
+
+```bash
+.venv/bin/python -m orderly.service orders     # 127.0.0.1:8112; payments 8113, notifications 8114
+curl -s http://127.0.0.1:8112/health           # {"service":"orders","schema_expected":1,"schema":1,"status":"ok","problems":{}}
 ```
 
 The scripts on their own:
@@ -77,7 +85,7 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 162 tests in about 23 s here (more while the machine is busy):
+`make check` runs 171 tests in about 25 s here (more while the machine is busy):
 
 - **Messages** (67): the canonical bytes pinned; 39 malformed inputs, each refused for its own reason (duplicate keys,
   NaN, a full-width digit in a time, booleans and floats as integers, non-canonical UUIDs, a 5,000-digit number,
@@ -94,6 +102,9 @@ Erlang distribution (25673) and epmd to loopback.
 - **The RabbitMQ script** (9, each starting its own node): start/stop/status, loopback-only listeners, a busy port, a
   foreign directory left alone, a live pid that isn't the node neither signalled nor forgotten, a stale pid file, a
   symlinked directory.
+- **The service skeleton** (9): each service starts by migrating its database and declaring the topology, then
+  `/health` says 200; a schema behind the code, a lost database pool, a closed broker connection each give 503 naming
+  the problem; edited migration history or an unreachable broker stops the start.
 - **The PostgreSQL script** (10, on databases under a random `ORDERLY_PG_PREFIX`): create makes and migrates them
   once, with `PYTHON=python` as CI passes it; status; drop asks, then drops only its own four; a prefix that isn't a
   plain identifier (it goes into SQL) refused.
@@ -136,7 +147,8 @@ retries (day 3) therefore never requeue: they go through wait queues with their 
 
 ## Limitations (day 1)
 
-- No services yet: the monolith and the order service are day 2, payment and notification day 3.
+- No service logic yet: each service starts, migrates and reports health, nothing more. The monolith and the order
+  service are day 2, payment and notification day 3.
 - The RabbitMQ script tests run only where RabbitMQ is installed; CI uses a service container and skips them.
 - One RabbitMQ node: quorum queues are replicated only on a cluster, which this project doesn't run.
 
