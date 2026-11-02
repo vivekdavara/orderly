@@ -73,7 +73,15 @@ def create_app(settings: Settings) -> FastAPI:
         try:
             async with broker.channel() as channel:
                 await settings.topology.declare(channel)
-            pool = AsyncConnectionPool(settings.database_url, min_size=1, max_size=10, open=False)
+            # check: a connection the server has ended (a restart, an idle timeout) is replaced when it is handed out,
+            # instead of failing the next /health with "terminating connection" (day-1 review, round 2).
+            pool = AsyncConnectionPool(
+                settings.database_url,
+                min_size=1,
+                max_size=10,
+                open=False,
+                check=AsyncConnectionPool.check_connection,
+            )
             try:
                 # Inside the try: a pool whose first connections time out still has workers retrying them, and
                 # only close() stops those.
