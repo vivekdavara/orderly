@@ -11,6 +11,7 @@ import pytest
 from fastapi import FastAPI
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
+from orderly import service
 from orderly.broker import amqp_url
 from orderly.migrate import Migration, MigrationError, migrate
 from orderly.service import PORTS, Resources, Settings, create_app
@@ -122,3 +123,52 @@ async def test_a_pool_that_cant_fill_is_closed_not_left_retrying(
         async with running(create_app(settings(fresh_database, topology))):
             pass
     assert closed == [True]
+
+
+# The rest kill mutants of service.py that the day-1 review's second round found no test noticed.
+
+
+async def test_shutdown_closes_the_broker_connection_and_the_pool(fresh_database: str, topology: Topology) -> None:
+    app = create_app(settings(fresh_database, topology))
+    async with running(app):
+        resources: Resources = app.state.resources
+    assert resources.broker.is_closed
+    assert resources.pool.closed
+
+
+async def test_a_broker_reconnecting_is_unhealthy(fresh_database: str, topology: Topology) -> None:
+    app = create_app(settings(fresh_database, topology))
+    async with running(app) as client:
+        resources: Resources = app.state.resources
+        resources.broker.connected.clear()  # what aio-pika's robust connection does while it reconnects
+        try:
+            response = await client.get("/health")
+        finally:
+            resources.broker.connected.set()
+    assert response.status_code == 503
+    assert response.json()["problems"] == {"broker": "connection lost, reconnecting"}
+
+
+async def test_a_database_slower_than_the_health_timeout_is_unhealthy(
+    fresh_database: str, topology: Topology, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert service.HEALTH_TIMEOUT == 2.0  # DESIGN.md: "answers (within 2 s)"
+    app = create_app(settings(fresh_database, topology))
+    async with running(app) as client:
+        monkeypatch.setattr(service, "HEALTH_TIMEOUT", 1e-6)
+        response = await client.get("/health")
+    assert response.status_code == 503
+    assert response.json()["problems"] == {"database": "TimeoutError"}
+
+
+async def test_a_schema_ahead_of_the_code_is_unhealthy_too(fresh_database: str, topology: Topology) -> None:
+    """A decision, not an accident: an instance only reports healthy on exactly the schema it was written for (it
+    refuses to start on a newer one too). Mixed versions during a rolling deploy would need expand/contract
+    migrations and a looser rule; DESIGN.md says so."""
+    app = create_app(settings(fresh_database, topology))
+    async with running(app) as client:
+        with psycopg.connect(fresh_database, autocommit=True) as conn:
+            conn.execute("INSERT INTO schema_migrations (version, name, sha256) VALUES (2, 'next', 'x')")
+        response = await client.get("/health")
+    assert response.status_code == 503
+    assert response.json()["problems"] == {"schema": "database at migration 2, this code expects 1"}

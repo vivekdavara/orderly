@@ -128,7 +128,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, help="default: 8112 orders, 8113 payments, 8114 notifications")
     args = parser.parse_args()
     app = create_app(Settings.from_environment(args.service))
-    uvicorn.run(app, host="127.0.0.1", port=args.port or PORTS[args.service])
+    uvicorn.run(app, host="127.0.0.1", port=PORTS[args.service] if args.port is None else args.port)
 
 
 if __name__ == "__main__":

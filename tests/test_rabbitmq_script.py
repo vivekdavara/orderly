@@ -159,3 +159,32 @@ def test_reset_deletes_its_directory(node: Node) -> None:
 def test_usage(node: Node) -> None:
     result = node.run("restart")
     assert result.returncode == 2 and "usage:" in result.stderr
+
+
+def test_a_long_lsof_listing_doesnt_make_a_live_node_look_stopped(node: Node, tmp_path: Path) -> None:
+    """`lsof | grep -q` under pipefail: grep exits at its match, lsof gets SIGPIPE writing the rest, and the pipeline
+    fails, so a live node looked stopped once lsof's output outgrew the pipe buffer (a surviving mutant of the review's
+    second round). A fake lsof prints the match and then 1 MB more, as a busy node's listing could."""
+    node.directory.mkdir()
+    (node.directory / ".orderly-rabbitmq").touch()
+    log = node.directory.resolve() / "log" / f"{node.env['ORDERLY_RABBITMQ_NODE']}.log"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "lsof"
+    fake.write_text(
+        "#!/bin/bash\nset -o pipefail\n"
+        f'printf "p%s\\nn%s\\n" "$2" "{log}"\n'
+        "head -c 1000000 /dev/zero | tr '\\0' 'x'\n"
+    )
+    fake.chmod(0o755)
+    stand_in = subprocess.Popen(["sleep", "60"])
+    try:
+        (node.directory / "rabbitmq.pid").write_text(f"{stand_in.pid}\n")
+        node.env["PATH"] = f"{bin_dir}{os.pathsep}{node.env['PATH']}"
+        result = node.run("status")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.startswith(f"running (pid {stand_in.pid})")
+    finally:
+        stand_in.kill()
+        stand_in.wait()
+        (node.directory / "rabbitmq.pid").unlink()
