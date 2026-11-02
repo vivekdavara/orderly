@@ -89,10 +89,11 @@ Cents = Annotated[StrictInt, Field(ge=0, le=MAX_CENTS)]
 Currency = Annotated[str, Field(strict=True, pattern=r"^[A-Z]{3}$")]
 CustomerId = Annotated[str, Field(strict=True, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$")]
 # No control characters (C0, DEL, C1): PostgreSQL text can't hold NUL, so an e-mail with one would decode fine and then
-# fail its handler on every delivery instead of being refused as undecodable (day-1 review).
-Email = Annotated[
-    str, Field(strict=True, max_length=254, pattern=r"^[^@\s\x00-\x1F\x7F-\x9F]+@[^@\s\x00-\x1F\x7F-\x9F]+$")
-]
+# fail its handler on every delivery instead of being refused as undecodable (day-1 review). No whitespace either,
+# spelled out rather than \s: \s means different sets in pydantic's Rust regex, Python's re and the JSON Schema's
+# ECMA-262 (only ECMA's has U+FEFF), and the published schema must not refuse what decode accepts (review round 2).
+_NOT_IN_EMAIL = r"@\x00-\x20\x7F-\x9F\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF"
+Email = Annotated[str, Field(strict=True, max_length=254, pattern=f"^[^{_NOT_IN_EMAIL}]+@[^{_NOT_IN_EMAIL}]+$")]
 
 
 class Payload(BaseModel):
