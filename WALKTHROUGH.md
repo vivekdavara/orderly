@@ -159,6 +159,14 @@ see the other's work (now the transaction pins READ COMMITTED first). The others
 PostgreSQL script reported success after a failed statement (`set -e` ignores the left of `&&`), the empty routing key,
 control characters in e-mails, a correlation id that wasn't the order.
 
+**Did the fixes hold?**
+A second round looked only at what the fixes and the new code broke, and found three things: the service's pool
+handed out connections the server had ended, so `/health` said the database was down once per stale connection (the
+pool checks connections now); the e-mail pattern's `\s` is a different set in Rust, Python and the JSON Schema's
+ECMA-262, so the published schema refused an e-mail `decode` accepted (whitespace is spelled out now, and a test runs
+the schema's own pattern in Node); and the PostgreSQL script still read a failed existence check as "missing". Round
+1's fix to the same script had covered only a failing DROP: fixes are where the next bugs are.
+
 **And the mutation pass?**
 It changed one thing at a time in the three core modules and listed the changes no test noticed (22 mutants as I
 re-applied them): boundaries

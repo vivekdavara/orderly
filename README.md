@@ -50,7 +50,7 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `scripts/rabbitmq.sh` | A local RabbitMQ node on 127.0.0.1:5673, kept apart from any other RabbitMQ on the machine |
 | `scripts/postgres.sh` | Creates, migrates, lists and drops Orderly's databases on the local PostgreSQL 14 (`ORDERLY_PG_PREFIX` renames them) |
 | `scripts/measure_test_fixture.py` | Times CREATE DATABASE against CREATE SCHEMA (why each test gets a schema) |
-| `tests/` | 213 tests: unit, property and integration tests against the real servers |
+| `tests/` | 231 tests: unit, property and integration tests against the real servers |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
 ## Run it
@@ -85,7 +85,7 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 213 tests in about 27 s here (more while the machine is busy):
+`make check` runs 231 tests in about 29 s here (more while the machine is busy):
 
 - **Messages** (84): the canonical bytes pinned; malformed inputs each refused for its own reason (duplicate keys,
   NaN, a full-width digit in a time, booleans and floats as integers, non-canonical UUIDs, a 5,000-digit number,
@@ -103,15 +103,17 @@ Erlang distribution (25673) and epmd to loopback.
   nothing, not even the bookkeeping; edited (whitespace included), renamed, newer and gapped histories refused, and
   history read in version order whatever the storage order; four migrators started at once apply once; a connection
   inside a transaction refused; each invariant of DESIGN.md "Data" enforced by the database itself.
-- **The service skeleton** (10): each service starts by migrating its database and declaring the topology, then
-  `/health` says 200; a schema behind the code, a lost database pool, a closed broker connection each give 503 naming
-  the problem; edited migration history or an unreachable broker stops the start; a pool that can't fill is closed.
-- **The scripts**: `rabbitmq.sh` (9, each starting its own node: start/stop/status, loopback-only listeners, a busy
+- **The service skeleton** (14): each service starts by migrating its database and declaring the topology, then
+  `/health` says 200; a schema behind or ahead of the code, a lost database pool, a database slower than the 2 s
+  timeout, a closed or reconnecting broker connection each give 503 naming the problem; edited migration history or
+  an unreachable broker stops the start; a pool that can't fill is closed; shutdown closes the pool and the broker.
+- **The scripts**: `rabbitmq.sh` (10, each starting its own node, and a fake `lsof` printing 1 MB: start/stop/status, loopback-only listeners, a busy
   port, a foreign directory left alone, a live pid that isn't the node neither signalled nor forgotten, a stale pid
-  file, a symlinked directory) and `postgres.sh` (10, on databases under a random `ORDERLY_PG_PREFIX`: create makes
+  file, a symlinked directory, a long `lsof` listing) and `postgres.sh` (10, on databases under a random `ORDERLY_PG_PREFIX`: create makes
   and migrates them once, with `PYTHON=python` as CI passes it; status; drop asks, then drops only its own four; a
   prefix that isn't a plain identifier refused).
-- **The review's tests** (15, `tests/review_d1/`): each failed on the code it was written against and passes now.
+- **The review's tests** (28, `tests/review_d1/` and `tests/review_d1r2/`): each failed on the code it was written
+  against and passes now.
 - And one that the package's version matches `pyproject.toml`.
 
 A full run leaves nothing behind on the shared servers (no queue, exchange, schema or database; checked after a run
@@ -158,6 +160,15 @@ re-applied here); each now has a test, and each mutant was re-applied and fails 
 were settled in `3c83729`. What held: no input made `decode` raise anything but `InvalidMessage`; the round trip held
 for years 1 to 9999; the routing, the confirmed mandatory publish and both delivery-limit claims; the history checks
 under READ COMMITTED; the scripts refusing what isn't theirs.
+
+A second round (16:19-16:29, at `031b35f`) asked what the fixes and the new code broke. Three defects, all fixed:
+`/health` answered 503 once per pooled connection the server had ended (no pool check; `ac9da17`); the e-mail
+pattern's `\s` meant different sets in Rust, Python and ECMA-262, so the published schema refused an e-mail with
+U+FEFF that `decode` accepted (whitespace now spelled out, checked against Node; `ea77e71`); and `postgres.sh` read a
+failed existence check as "missing" and still exited 0 (`ebdd7ec`). Its surviving mutants (shutdown closing the
+broker, the health timeout, the reconnecting state, the `lsof` pipe, the C1 boundary) are tested now, and "a schema
+ahead of the code is unhealthy" is pinned as a decision (`dd3e265`). What held: READ COMMITTED with a SERIALIZABLE
+connection and with the lock already held, `-1` really meaning no limit, cleanup on every failed start.
 
 ## Design decisions
 
