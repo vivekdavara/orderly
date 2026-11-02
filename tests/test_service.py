@@ -9,6 +9,7 @@ import httpx
 import psycopg
 import pytest
 from fastapi import FastAPI
+from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from orderly.broker import amqp_url
 from orderly.migrate import Migration, MigrationError, migrate
@@ -99,3 +100,25 @@ def test_unknown_services_and_the_port_map() -> None:
     with pytest.raises(ValueError, match="unknown service 'inventory'"):
         create_app(Settings("inventory", "postgresql://x/y", "amqp://x/"))
     assert PORTS == {"orders": 8112, "payments": 8113, "notifications": 8114}
+
+
+async def test_a_pool_that_cant_fill_is_closed_not_left_retrying(
+    fresh_database: str, topology: Topology, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[bool] = []
+
+    class StuckPool(AsyncConnectionPool):
+        # The overrides keep psycopg_pool's own signatures, `timeout` included.
+        async def open(self, wait: bool = False, timeout: float = 30.0) -> None:  # noqa: ASYNC109
+            await super().open(wait=False)
+            raise PoolTimeout("pool initialization incomplete after 10.0 sec")
+
+        async def close(self, timeout: float = 5.0) -> None:  # noqa: ASYNC109
+            closed.append(True)
+            await super().close(timeout)
+
+    monkeypatch.setattr("orderly.service.AsyncConnectionPool", StuckPool)
+    with pytest.raises(PoolTimeout):
+        async with running(create_app(settings(fresh_database, topology))):
+            pass
+    assert closed == [True]

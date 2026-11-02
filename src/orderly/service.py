@@ -74,8 +74,10 @@ def create_app(settings: Settings) -> FastAPI:
             async with broker.channel() as channel:
                 await settings.topology.declare(channel)
             pool = AsyncConnectionPool(settings.database_url, min_size=1, max_size=10, open=False)
-            await pool.open(wait=True, timeout=10)
             try:
+                # Inside the try: a pool whose first connections time out still has workers retrying them, and
+                # only close() stops those.
+                await pool.open(wait=True, timeout=10)
                 app.state.resources = Resources(settings, pool, broker)
                 yield
             finally:
