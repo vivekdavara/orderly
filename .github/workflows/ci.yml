@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        # The same major version as the laptop's server.
+        image: postgres:14
+        env:
+          # A throwaway password for a container that lives as long as this job.
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: orderly_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+      rabbitmq:
+        # The same version as Homebrew's RabbitMQ on the laptop: the delivery-limit tests pin 4.x behaviour. Mapped to
+        # 5673, the port the local node uses. The image lets guest connect from outside the container.
+        image: rabbitmq:4.3
+        ports:
+          - 5673:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_port_connectivity"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 30
+    env:
+      # A missing service fails the run instead of skipping its tests.
+      ORDERLY_REQUIRE_SERVICES: "1"
+      ORDERLY_AMQP_URL: amqp://guest:guest@localhost:5673/
+      ORDERLY_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/orderly_test
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: pip install -e '.[dev]'
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Type-check
+        run: mypy
+      - name: Test
+        run: pytest
+      - name: Create and migrate the service databases with the script
+        run: |
+          PYTHON=python scripts/postgres.sh create
+          PYTHON=python scripts/postgres.sh create
+          scripts/postgres.sh status
