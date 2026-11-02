@@ -160,3 +160,33 @@ def test_a_connection_inside_a_transaction_is_refused(fresh_database: str) -> No
             migrate(conn, "orders")
         conn.rollback()
         assert migrate(conn, "orders") == [1]  # idle again: fine, even without autocommit
+
+
+# The rest kill mutants of migrate.py that the day-1 review found no test noticed.
+
+
+def test_load_skips_pycache_but_refuses_a_directory_named_like_a_migration(tmp_path: Path) -> None:
+    write(tmp_path, {"0001_a.sql": "A"})
+    (tmp_path / "__pycache__").mkdir()
+    assert load(tmp_path) == [Migration(1, "a", "A")]
+    (tmp_path / "0002_b.sql").mkdir()
+    with pytest.raises(MigrationError, match=r"0002_b\.sql: not a migration"):
+        load(tmp_path)
+
+
+def test_a_whitespace_only_edit_is_still_an_edit(fresh_database: str) -> None:
+    with psycopg.connect(fresh_database, autocommit=True) as conn:
+        migrate(conn, "orders", [Migration(1, "a", "CREATE TABLE a (x int)")])
+        with pytest.raises(MigrationError, match="was applied as a with SHA-256"):
+            migrate(conn, "orders", [Migration(1, "a", "CREATE TABLE a (x int)\n")])
+
+
+def test_the_history_is_read_in_version_order_not_storage_order(fresh_database: str) -> None:
+    files = [Migration(1, "a", "SELECT 1"), Migration(2, "b", "SELECT 2")]
+    with psycopg.connect(fresh_database, autocommit=True) as conn:
+        migrate(conn, "orders", files)
+        # Rewrite row 1 so it is stored after row 2: a scan without ORDER BY now meets 2 first.
+        conn.execute("UPDATE schema_migrations SET applied_at = applied_at WHERE version = 1")
+        stored = [row[0] for row in conn.execute("SELECT version FROM schema_migrations")]
+        assert stored == [2, 1], "the setup didn't reorder the rows"
+        assert migrate(conn, "orders", files) == []

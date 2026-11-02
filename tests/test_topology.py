@@ -225,3 +225,61 @@ async def test_topic_matching_agrees_with_the_broker(channel: AbstractChannel) -
         assert received == [key for key in keys if topic_matches(pattern, key)], pattern
         checked += len(keys)
     assert checked > 1000
+
+
+# The rest kill mutants of topology.py that the day-1 review found no test noticed.
+
+
+def test_the_queue_arguments_are_the_designs() -> None:
+    topology = Topology(prefix="p.")
+    assert DELIVERY_LIMIT == 10  # DESIGN.md says 10
+    assert topology.queue_arguments("payment.commands") == {
+        "x-queue-type": "quorum",
+        "x-delivery-limit": 10,
+        "x-dead-letter-exchange": "p.orderly.dlx",
+        "x-dead-letter-routing-key": "p.payment.commands.dlq",
+        "x-dead-letter-strategy": "at-least-once",
+        "x-overflow": "reject-publish",  # at-least-once dead-lettering needs it; drop-head silently falls back
+    }
+    assert topology.dead_letter_queue_arguments() == {"x-queue-type": "quorum", "x-delivery-limit": -1}
+
+
+async def test_the_exchanges_are_durable_and_of_the_designed_types(
+    connection: AbstractConnection, topology: Topology
+) -> None:
+    """RabbitMQ refuses to redeclare an exchange with another type or durability, which shows what it holds."""
+    wrong = [
+        (topology.commands, aio_pika.ExchangeType.TOPIC, True),
+        (topology.commands, aio_pika.ExchangeType.DIRECT, False),
+        (topology.events, aio_pika.ExchangeType.DIRECT, True),
+        (topology.events, aio_pika.ExchangeType.TOPIC, False),
+        (topology.dead_letters, aio_pika.ExchangeType.TOPIC, True),
+        (topology.dead_letters, aio_pika.ExchangeType.DIRECT, False),
+    ]
+    for name, kind, durable in wrong:
+        async with connection.channel() as channel:
+            with pytest.raises(aio_pika.exceptions.ChannelPreconditionFailed):
+                await channel.declare_exchange(name, kind, durable=durable)
+
+
+async def test_the_dead_letter_queues_are_quorum_queues(connection: AbstractConnection, topology: Topology) -> None:
+    for spec in QUEUES:
+        async with connection.channel() as channel:
+            with pytest.raises(aio_pika.exceptions.ChannelPreconditionFailed):
+                await channel.declare_queue(topology.dead_letter_queue(spec.name), durable=True)  # classic
+
+
+async def test_delete_removes_everything_declare_made(connection: AbstractConnection) -> None:
+    topology = Topology(prefix=f"test-{uuid.uuid4().hex[:12]}.")
+    async with connection.channel() as channel:
+        await topology.declare(channel)
+        await topology.delete(channel)
+    names = [name for spec in QUEUES for name in (topology.queue(spec.name), topology.dead_letter_queue(spec.name))]
+    for name in names:
+        async with connection.channel() as channel:
+            with pytest.raises(aio_pika.exceptions.ChannelNotFoundEntity):
+                await channel.declare_queue(name, passive=True)
+    for exchange in (topology.commands, topology.events, topology.dead_letters):
+        async with connection.channel() as channel:
+            with pytest.raises(aio_pika.exceptions.ChannelNotFoundEntity):
+                await channel.get_exchange(exchange, ensure=True)
