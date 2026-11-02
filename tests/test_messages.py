@@ -137,6 +137,7 @@ def test_every_type_has_a_kind_and_names_its_service() -> None:
         (wire(**{"payload.customer_id": "c" * 65}), "payload.customer_id"),
         (wire(**{"payload.reason": "declined"}), "payload.reason: Extra inputs"),
         (wire(**{"payload.order_id": _DELETE}), "payload.order_id: Field required"),
+        (wire(causation_id=str(MESSAGE)), "a message can't be its own cause"),
     ],
 )
 def test_malformed_messages_are_refused_with_a_reason(body: bytes, reason: str) -> None:
@@ -297,6 +298,7 @@ def test_the_schema_refuses_what_it_can_express(body: bytes) -> None:
         wire(**{"payload.amount_cents": 2599.0}),
         wire(**{"payload.currency": "USD\n"}),
         wire(correlation_id=str(MESSAGE)),
+        wire(causation_id=str(MESSAGE)),
     ],
 )
 def test_the_decoder_is_stricter_than_the_schema_where_its_docstring_says(body: bytes) -> None:

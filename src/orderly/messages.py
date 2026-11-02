@@ -216,6 +216,8 @@ class Message(BaseModel):
             raise ValueError(
                 f"correlation_id {self.correlation_id} must be the payload's order_id {self.payload.order_id}"
             )
+        if self.causation_id == self.message_id:
+            raise ValueError("a message can't be its own cause (causation_id == message_id)")
         return self
 
     @property
@@ -328,8 +330,8 @@ def json_schema() -> dict[str, Any]:
 
     It describes the shape for other tools and languages; `decode` stays the authority and is stricter than a schema
     can say: it also refuses duplicate keys, impossible dates (February 30), 2599.0 as an amount (JSON Schema calls
-    that an integer), a newline before the end of a pattern-checked string (which Python's `re` lets `$` match), and a
-    correlation_id other than the payload's order_id.
+    that an integer), a newline before the end of a pattern-checked string (which Python's `re` lets `$` match), a
+    correlation_id other than the payload's order_id, and a causation_id equal to the message's own id.
     """
     uuid_schema = {"type": "string", "pattern": f"^{_UUID_PATTERN}$"}
     variants = []

@@ -54,7 +54,12 @@ running_pid() {
   pid="$(cat "$PIDFILE")"
   case "$pid" in '' | *[!0-9]* | 0) return 1 ;; esac
   kill -0 "$pid" 2>/dev/null || return 1
-  lsof -p "$pid" -Fn 2>/dev/null | grep -qxF -- "n$DIR/log/$NODE.log" || return 1
+  # Read lsof's output whole, then search it: `lsof | grep -q` under pipefail fails when grep exits at its match
+  # and lsof, still writing, gets SIGPIPE (only with output past the pipe's buffer, but then a live node looked
+  # stopped).
+  local files
+  files="$(lsof -p "$pid" -Fn 2>/dev/null || true)"
+  grep -qxF -- "n$DIR/log/$NODE.log" <<< "$files" || return 1
   echo "$pid"
 }
 

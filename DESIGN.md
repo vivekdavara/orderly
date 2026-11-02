@@ -194,8 +194,8 @@ Commands name the one service that must act; events state a fact anyone may subs
 The contract is also published as a JSON Schema, `docs/message-schema.json` (draft 2020-12, one variant per type),
 generated from the code by `scripts/export_message_schema.py` and checked by a test against both the code and every
 message the encoder produces. `decode` stays the authority and is stricter than the schema can say: it also refuses
-duplicate keys, impossible dates, `2599.0` as an amount, a newline before the end of a pattern-checked string, and a
-`correlation_id` other than the payload's `order_id`.
+duplicate keys, impossible dates, `2599.0` as an amount, a newline before the end of a pattern-checked string, a
+`correlation_id` other than the payload's `order_id`, and a message naming itself as its cause.
 
 ## RabbitMQ topology
 

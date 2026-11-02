@@ -49,6 +49,10 @@ async def publish(channel: AbstractChannel, topology: Topology, message: Message
     `mandatory` makes a message no queue is bound for come back as an error (aio_pika.exceptions.DeliveryError)
     instead of being dropped.
     """
+    # aio-pika only logs a returned message on a channel without on_return_raises: refuse such a channel rather than
+    # let an unroutable message look published (the day-1 review's suggestion).
+    if not (channel.publisher_confirms and getattr(channel, "on_return_raises", False)):
+        raise ValueError("publish needs a channel from open_channel (confirms on, returns raised)")
     exchange_name, routing_key = topology.destination(message.type)
     exchange = await channel.get_exchange(exchange_name, ensure=False)
     await exchange.publish(to_amqp(message), routing_key=routing_key, mandatory=True)

@@ -133,10 +133,21 @@ async def test_a_message_no_queue_takes_is_an_error_not_a_drop(connection: Abstr
     # Only the exchanges exist: nothing is bound, so the mandatory publish comes back.
     bare = Topology(prefix=f"test-{uuid.uuid4().hex[:12]}.")
     async with await open_channel(connection) as channel:
-        await channel.declare_exchange(bare.commands, aio_pika.ExchangeType.DIRECT, auto_delete=True)
-        with pytest.raises(aio_pika.exceptions.DeliveryError):
-            await publish(channel, bare, ONE_OF_EACH[0])
-        await channel.exchange_delete(bare.commands)
+        # Deleted in a finally: auto_delete never removes an exchange that was never bound (the review found two left).
+        await channel.declare_exchange(bare.commands, aio_pika.ExchangeType.DIRECT)
+        try:
+            with pytest.raises(aio_pika.exceptions.DeliveryError):
+                await publish(channel, bare, ONE_OF_EACH[0])
+        finally:
+            await channel.exchange_delete(bare.commands)
+
+
+async def test_publish_refuses_a_channel_that_would_drop_returns(
+    connection: AbstractConnection, topology: Topology
+) -> None:
+    async with connection.channel() as plain:  # on_return_raises is off by default
+        with pytest.raises(ValueError, match="needs a channel from open_channel"):
+            await publish(plain, topology, ONE_OF_EACH[0])
 
 
 async def test_a_rejected_message_goes_to_the_dead_letter_queue(channel: AbstractChannel, topology: Topology) -> None:
