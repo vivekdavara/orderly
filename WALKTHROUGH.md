@@ -64,7 +64,7 @@ A message that doesn't decode never will, so it shouldn't be retried: it goes st
 being strict about the one canonical form means two services can't read the same bytes differently. `decode` refuses
 duplicate keys (JSON parsers usually keep the last one silently), NaN and Infinity, booleans or floats where integers
 belong (`True == 1` in Python), UUIDs and times in any but one spelling, unknown fields, and says why
-(`InvalidMessage.reason`). The tests pin 39 such inputs and fuzz the rest.
+(`InvalidMessage.reason`). The tests pin 57 such inputs and fuzz the rest.
 
 **Give me an example of a subtle one.**
 Times: Python's `strptime` accepts a full-width digit (`２026-...`) as a year, so the pattern says `[0-9]`, not `\d`
@@ -175,7 +175,8 @@ mutant to see it fail.
 - RabbitMQ 4.3 refuses a topic binding key with more than two `#`, which my random-pattern test hit at once.
 - The script tests' port picker asked the OS for a port and added 20,000 for the distribution port: macOS's ephemeral
   ports start at 49152, so there was never room.
-- A commit message claimed 2,000+ pairs for the topic differential; it was 1,584 (corrected in the README's commit).
+- A commit message claimed 2,000+ pairs for the topic differential; it was 1,584 (corrected in the README's commit;
+  1,665 now that the empty pattern and key are in it).
 - I started the service once against the local broker before the dead-letter fix, so the real queues existed with the
   old arguments and the next start would have been refused as drift (which is the point of declaring at startup). I
   deleted the empty queues and redeclared them.
