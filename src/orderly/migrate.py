@@ -72,11 +72,18 @@ def migrations(service: str) -> list[Migration]:
 def migrate(conn: psycopg.Connection[Any], service: str, available: Sequence[Migration] | None = None) -> list[int]:
     """Apply what the database lacks; return the versions applied now (empty if it was up to date).
 
-    `conn` should be in autocommit mode: the work runs in its own transaction, and the advisory lock is held until
-    that transaction ends.
+    `conn` must not be inside a transaction (an autocommit connection is simplest): the work runs in its own
+    transaction, and the advisory lock is held until that transaction ends.
     """
+    if conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+        raise MigrationError("migrate needs a connection outside any transaction (use autocommit=True)")
     files = list(migrations(service) if available is None else available)
     with conn.transaction():
+        # READ COMMITTED whatever the database's default: each statement then sees what was committed before it
+        # started. Under REPEATABLE READ the snapshot would be taken by the lock statement, before the lock is
+        # granted, and a migrator that waited for another wouldn't see its work (it re-applied migration 1 and
+        # failed with DuplicateTable; found by the day-1 review).
+        conn.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
         conn.execute("SELECT pg_advisory_xact_lock(%s)", (_LOCK_KEY,))
         conn.execute(
             """CREATE TABLE IF NOT EXISTS schema_migrations (

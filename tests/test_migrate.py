@@ -151,3 +151,12 @@ def test_the_command_line(fresh_database: str, capsys: pytest.CaptureFixture[str
     out, err = capsys.readouterr()
     assert out.splitlines() == ["payments: applied [1], now at 1", "payments: up to date at 1"]
     assert "payments: migration 1 was applied as initial with SHA-256 edited..." in err
+
+
+def test_a_connection_inside_a_transaction_is_refused(fresh_database: str) -> None:
+    with psycopg.connect(fresh_database) as conn:  # not autocommit: the SELECT opens a transaction
+        conn.execute("SELECT 1")
+        with pytest.raises(MigrationError, match="outside any transaction"):
+            migrate(conn, "orders")
+        conn.rollback()
+        assert migrate(conn, "orders") == [1]  # idle again: fine, even without autocommit
