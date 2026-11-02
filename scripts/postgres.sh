@@ -10,7 +10,7 @@
 # drop: drops exactly those databases, after asking (ORDERLY_PG_YES=1 to skip the question).
 #
 # Connection: libpq's own variables (PGHOST, PGPORT, PGUSER, PGPASSWORD); defaults localhost:5432 as the current
-# user. Unlike the RabbitMQ script this starts no server: the PostgreSQL 14 server is shared by the portfolio's
+# user. ORDERLY_PG_PREFIX (default orderly) names the databases <prefix>_orders, ...: the script's tests use their own. Unlike the RabbitMQ script this starts no server: the PostgreSQL 14 server is shared by the portfolio's
 # projects, each with its own databases.
 set -euo pipefail
 
@@ -20,9 +20,13 @@ export PGPORT="${PGPORT:-5432}"
 PSQL="${PSQL:-psql}"
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
 SERVICES=(orders payments notifications)
-TEST_DB=orderly_test
+PREFIX="${ORDERLY_PG_PREFIX:-orderly}"
+TEST_DB="${PREFIX}_test"
 
 die() { echo "postgres.sh: $*" >&2; exit 1; }
+
+# The names go into SQL unquoted, so the prefix must be a plain lowercase identifier.
+[[ "$PREFIX" =~ ^[a-z][a-z0-9_]{0,40}$ ]] || die "ORDERLY_PG_PREFIX must match [a-z][a-z0-9_]*, got '$PREFIX'"
 
 q() { "$PSQL" -X -q -v ON_ERROR_STOP=1 -d postgres -Atc "$1"; }
 
@@ -34,7 +38,7 @@ server_up() {
 
 all_databases() {
   local service
-  for service in "${SERVICES[@]}"; do echo "orderly_$service"; done
+  for service in "${SERVICES[@]}"; do echo "${PREFIX}_$service"; done
   echo "$TEST_DB"
 }
 
@@ -53,10 +57,13 @@ create() {
 
 migrate() {
   server_up
-  [ -x "$PYTHON" ] || die "no $PYTHON (make venv)"
+  # A path (the default) or a command name (CI sets PYTHON=python): command -v resolves both.
+  local python
+  python="$(command -v "$PYTHON" || true)"
+  [ -n "$python" ] || die "no $PYTHON (make venv, or set PYTHON)"
   local service
   for service in "${SERVICES[@]}"; do
-    "$PYTHON" -m orderly.migrate "$service" --url "postgresql:///orderly_$service"
+    "$python" -m orderly.migrate "$service" --url "postgresql:///${PREFIX}_$service"
   done
 }
 
