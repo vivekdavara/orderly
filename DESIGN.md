@@ -223,8 +223,11 @@ A service never publishes from inside a request or a handler. It writes the mess
 same transaction as the change it describes; a relay publishes it afterwards:
 
 ```
-outbox(id bigserial, message_id uuid unique, exchange, routing_key, body bytea, created_at, published_at null)
+outbox(id bigserial, message_id uuid unique, message_type, body bytea, created_at, published_at null)
 ```
+
+The row holds the message's type, not an exchange and routing key: the relay asks the topology where a type goes, so
+the routing lives in one place.
 
 - The relay claims unpublished rows in id order (`FOR UPDATE SKIP LOCKED`, a batch at a time), publishes each with
   confirms, then marks them published in the same transaction. A crash between publishing and committing the mark
@@ -262,8 +265,21 @@ outbox never does) can't send two e-mails.
 ## Data
 
 All money is integer cents, all times `timestamptz` in UTC with microsecond precision. Each service database gets its
-schema from numbered SQL migrations under `src/orderly/migrations/<service>/`, applied by `orderly.migrate`, which
-records each one's SHA-256 and refuses to run against a database whose applied migration has since been edited.
+schema from numbered SQL migrations under `src/orderly/migrations/<service>/`, applied by `orderly.migrate`:
+
+- all pending migrations in **one transaction** (PostgreSQL's DDL is transactional), so a failure leaves the database
+  as it was, bookkeeping included;
+- under a **transaction-level advisory lock**, so services starting together don't both apply them (taken before the
+  `CREATE TABLE IF NOT EXISTS schema_migrations`, which itself races without it);
+- each applied migration's name and SHA-256 recorded, and a database whose history doesn't match the files (an
+  applied migration edited or renamed, a gap, a migration this code doesn't have) **refused**, not repaired;
+- a migrations folder holding anything but `NNNN_name.sql` files numbered 1, 2, 3... is an error, so a misnamed file
+  can't be skipped silently.
+
+The schemas (day 1, `0001_initial.sql` for each service) put the invariants in the database too: stock never below
+zero, a cancelled order has a reason and only a cancelled one does, an idempotency key always has its request hash, an
+order line's `sku` once per order, a payment's provider references matching its status, one notification of each kind
+per order.
 
 ## Testing
 

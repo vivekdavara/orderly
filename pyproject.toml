@@ -26,7 +26,7 @@ dev = ["pytest>=9.2", "pytest-asyncio>=1.4", "hypothesis>=6.170", "httpx>=0.28",
 where = ["src"]
 
 [tool.setuptools.package-data]
-orderly = ["py.typed"]
+orderly = ["py.typed", "migrations/*/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

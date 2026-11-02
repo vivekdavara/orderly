@@ -8,13 +8,16 @@ broken service container can't make the suite pass by skipping half of it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 
 import aio_pika
+import psycopg
 import pytest
 from aio_pika.abc import AbstractChannel, AbstractConnection
+from psycopg import conninfo, sql
 
 from orderly.broker import amqp_url, open_channel
 from orderly.topology import Topology
@@ -52,3 +55,44 @@ async def topology(connection: AbstractConnection) -> AsyncIterator[Topology]:
     yield topology
     async with connection.channel() as cleanup:
         await topology.delete(cleanup)
+
+
+def test_database_url() -> str:
+    return os.environ.get("ORDERLY_TEST_DATABASE_URL", "postgresql://localhost:5432/orderly_test")
+
+
+@pytest.fixture(scope="session")
+def test_database() -> str:
+    """The database the tests use (created if missing); each test gets its own schema in it."""
+    url = test_database_url()
+    try:
+        psycopg.connect(url, connect_timeout=5).close()
+    except psycopg.OperationalError as error:
+        if "does not exist" not in str(error):
+            _unavailable(f"PostgreSQL at {url}", error)
+        name = conninfo.conninfo_to_dict(url)["dbname"]
+        admin_url = conninfo.make_conninfo(url, dbname="postgres")
+        # DuplicateDatabase: another run made it just now.
+        with (
+            psycopg.connect(admin_url, autocommit=True) as admin,
+            contextlib.suppress(psycopg.errors.DuplicateDatabase),
+        ):
+            admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(str(name))))
+    return url
+
+
+@pytest.fixture
+def fresh_database(test_database: str) -> Iterator[str]:
+    """A URL whose connections see an empty database: a new schema, first on their search_path, dropped afterwards.
+
+    A schema rather than a database because PostgreSQL 14's CREATE DATABASE forces a checkpoint: 174-993 ms here
+    against about 1 ms for CREATE SCHEMA.
+    """
+    schema = f"t_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(test_database, autocommit=True) as conn:
+        conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    try:
+        yield conninfo.make_conninfo(test_database, options=f"-c search_path={schema}")
+    finally:
+        with psycopg.connect(test_database, autocommit=True) as conn:
+            conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
