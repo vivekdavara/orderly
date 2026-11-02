@@ -49,7 +49,9 @@ create() {
     if exists "$db"; then
       echo "$db exists"
     else
-      q "CREATE DATABASE $db" && echo "$db created"
+      # Not `q ... && echo`: set -e ignores a failure on the left of &&, and the script exited 0 after one.
+      q "CREATE DATABASE $db" || die "could not create $db"
+      echo "$db created"
     fi
   done
   migrate
@@ -92,13 +94,20 @@ drop() {
     read -r answer
     [ "$answer" = y ] || [ "$answer" = Y ] || { echo "nothing dropped"; return 0; }
   fi
-  local db
+  local db failed=0
   for db in $databases; do
     if exists "$db"; then
       # WITH (FORCE) ends the services' and tests' open connections instead of failing on them (PostgreSQL 13+).
-      q "DROP DATABASE $db WITH (FORCE)" && echo "$db dropped"
+      # A failure doesn't stop the others being dropped, but the script exits 1 naming it.
+      if q "DROP DATABASE $db WITH (FORCE)"; then
+        echo "$db dropped"
+      else
+        echo "postgres.sh: could not drop $db" >&2
+        failed=1
+      fi
     fi
   done
+  return "$failed"
 }
 
 case "${1:-}" in
