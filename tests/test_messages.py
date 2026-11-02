@@ -2,11 +2,13 @@ import contextlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
+from jsonschema import Draft202012Validator
 
 from orderly.messages import (
     MAX_CENTS,
@@ -24,6 +26,8 @@ from orderly.messages import (
     decode,
     encode,
     format_time,
+    json_schema,
+    json_schema_text,
     new_message,
 )
 
@@ -246,4 +250,56 @@ def test_a_changed_field_decodes_or_is_refused_never_anything_else(message: Mess
 @given(st.binary(max_size=200))
 def test_arbitrary_bytes_are_refused_cleanly(body: bytes) -> None:
     with contextlib.suppress(InvalidMessage):
+        decode(body)
+
+
+SCHEMA_FILE = Path(__file__).parents[1] / "docs" / "message-schema.json"
+
+
+def test_the_published_schema_is_the_codes() -> None:
+    assert SCHEMA_FILE.read_text() == json_schema_text(), "run scripts/export_message_schema.py"
+    Draft202012Validator.check_schema(json.loads(SCHEMA_FILE.read_text()))
+
+
+@given(messages)
+def test_every_encoded_message_matches_exactly_one_variant_of_the_schema(message: Message) -> None:
+    validator = Draft202012Validator(json_schema())
+    validator.validate(json.loads(encode(message)))  # oneOf: exactly one variant, else this raises
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        wire(type="payment.capture"),
+        wire(version=2),
+        wire(version=True),
+        wire(extra=1),
+        wire(causation_id=_DELETE),
+        wire(message_id="6F1C0C1E-6B8E-4C51-9D0E-2F1C4B0E7A10"),
+        wire(occurred_at="2026-11-02T20:15:03Z"),
+        wire(**{"payload.amount_cents": True}),
+        wire(**{"payload.amount_cents": "2599"}),
+        wire(**{"payload.amount_cents": 0}),
+        wire(**{"payload.amount_cents": MAX_CENTS + 1}),
+        wire(**{"payload.currency": "usd"}),
+        wire(**{"payload.reason": "declined"}),
+    ],
+)
+def test_the_schema_refuses_what_it_can_express(body: bytes) -> None:
+    assert not Draft202012Validator(json_schema()).is_valid(json.loads(body))
+    with pytest.raises(InvalidMessage):
+        decode(body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        wire(occurred_at="2026-02-30T20:15:03.123456Z"),
+        wire(**{"payload.amount_cents": 2599.0}),
+        wire(**{"payload.currency": "USD\n"}),
+    ],
+)
+def test_the_decoder_is_stricter_than_the_schema_where_its_docstring_says(body: bytes) -> None:
+    assert Draft202012Validator(json_schema()).is_valid(json.loads(body))
+    with pytest.raises(InvalidMessage):
         decode(body)

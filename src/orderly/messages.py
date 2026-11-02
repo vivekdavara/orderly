@@ -18,14 +18,25 @@ import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any, ClassVar, Literal, TypeAlias, cast
 
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, PlainValidator, StrictInt, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    PlainValidator,
+    StrictInt,
+    ValidationError,
+    WithJsonSchema,
+)
 
 VERSION = 1
 # Ten billion dollars in cents: far above any real order, far below bigint's limit.
 MAX_CENTS = 10**12
 
-_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z")
+_UUID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_TIME_PATTERN = r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z"
+_UUID = re.compile(_UUID_PATTERN)
+_TIME = re.compile(_TIME_PATTERN)
 
 
 class InvalidMessage(ValueError):
@@ -61,10 +72,16 @@ def format_time(value: datetime) -> str:
 
 
 CanonicalUUID = Annotated[
-    uuid.UUID, PlainValidator(_canonical_uuid, json_schema_input_type=str), PlainSerializer(str, return_type=str)
+    uuid.UUID,
+    PlainValidator(_canonical_uuid),
+    PlainSerializer(str, return_type=str),
+    WithJsonSchema({"type": "string", "pattern": f"^{_UUID_PATTERN}$"}),
 ]
 UtcTime = Annotated[
-    datetime, PlainValidator(_utc_micros, json_schema_input_type=str), PlainSerializer(format_time, return_type=str)
+    datetime,
+    PlainValidator(_utc_micros),
+    PlainSerializer(format_time, return_type=str),
+    WithJsonSchema({"type": "string", "pattern": f"^{_TIME_PATTERN}$"}),
 ]
 PositiveCents = Annotated[StrictInt, Field(gt=0, le=MAX_CENTS)]
 Cents = Annotated[StrictInt, Field(ge=0, le=MAX_CENTS)]
@@ -291,3 +308,54 @@ def decode(body: bytes) -> Message:
         causation_id=envelope.causation_id,
         payload=cast(AnyPayload, payload),
     )
+
+
+def json_schema() -> dict[str, Any]:
+    """The messages as a JSON Schema (draft 2020-12), published as docs/message-schema.json.
+
+    It describes the shape for other tools and languages; `decode` stays the authority and is stricter than a schema
+    can say: it also refuses duplicate keys, impossible dates (February 30), 2599.0 as an amount (JSON Schema calls
+    that an integer) and a newline before the end of a pattern-checked string (which Python's `re` lets `$` match).
+    """
+    uuid_schema = {"type": "string", "pattern": f"^{_UUID_PATTERN}$"}
+    variants = []
+    definitions = {}
+    for name, model in PAYLOADS.items():
+        definitions[model.__name__] = model.model_json_schema()
+        variants.append(
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "message_id",
+                    "type",
+                    "version",
+                    "occurred_at",
+                    "correlation_id",
+                    "causation_id",
+                    "payload",
+                ],
+                "properties": {
+                    "message_id": uuid_schema,
+                    "type": {"const": name},
+                    "version": {"const": VERSION},
+                    "occurred_at": {"type": "string", "pattern": f"^{_TIME_PATTERN}$"},
+                    "correlation_id": uuid_schema,
+                    "causation_id": {"oneOf": [uuid_schema, {"type": "null"}]},
+                    "payload": {"$ref": f"#/$defs/{model.__name__}"},
+                },
+            }
+        )
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://github.com/vivekdavara/orderly/blob/main/docs/message-schema.json",
+        "title": "Orderly message",
+        "description": f"Version {VERSION} of Orderly's message envelope, one variant per message type.",
+        "oneOf": variants,
+        "$defs": definitions,
+    }
+
+
+def json_schema_text() -> str:
+    """The schema as the committed file holds it."""
+    return json.dumps(json_schema(), indent=2, sort_keys=True) + "\n"

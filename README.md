@@ -42,13 +42,14 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | Path | What it is |
 |---|---|
 | `src/orderly/messages.py` | The contract: a JSON envelope around seven typed payloads; `decode` is strict and says why it refuses, `encode` is canonical |
+| `docs/message-schema.json` | The same contract as a JSON Schema, generated from the code (`scripts/export_message_schema.py`) and checked by tests |
 | `src/orderly/topology.py` | Exchanges, quorum queues, dead-letter queues and bindings as code; `routes()` says where each type goes |
 | `src/orderly/broker.py` | Persistent, mandatory, confirmed publishing on a channel where a returned message is an error |
 | `src/orderly/migrate.py`, `src/orderly/migrations/` | Numbered SQL migrations per service, applied in one transaction under an advisory lock; edited history refused |
 | `scripts/rabbitmq.sh` | A local RabbitMQ node on 127.0.0.1:5673, kept apart from any other RabbitMQ on the machine |
-| `scripts/postgres.sh` | Creates, migrates, lists and drops Orderly's databases on the local PostgreSQL 14 |
+| `scripts/postgres.sh` | Creates, migrates, lists and drops Orderly's databases on the local PostgreSQL 14 (`ORDERLY_PG_PREFIX` renames them) |
 | `scripts/measure_test_fixture.py` | Times CREATE DATABASE against CREATE SCHEMA (why each test gets a schema) |
-| `tests/` | 134 tests: unit, property and integration tests against the real servers |
+| `tests/` | 162 tests: unit, property and integration tests against the real servers |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
 ## Run it
@@ -76,12 +77,13 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 134 tests in about 20 s here (more while the machine is busy):
+`make check` runs 162 tests in about 23 s here (more while the machine is busy):
 
-- **Messages** (49): the canonical bytes pinned; 39 malformed inputs, each refused for its own reason (duplicate keys,
+- **Messages** (67): the canonical bytes pinned; 39 malformed inputs, each refused for its own reason (duplicate keys,
   NaN, a full-width digit in a time, booleans and floats as integers, non-canonical UUIDs, a 5,000-digit number,
   100,000 nested brackets...); Hypothesis round trips over all seven types; changed fields that decode or are refused,
-  never raise anything else; arbitrary bytes.
+  never raise anything else; arbitrary bytes; the published JSON Schema matching the code, accepting every encoded
+  message as exactly one variant, refusing what it can express, and laxer than the decoder exactly where documented.
 - **Topology** (23, on a real RabbitMQ): every type reaches exactly the queues `routes()` names; a redeclaration with
   other settings is refused; an unroutable publish is an error; rejected and poison messages are dead-lettered; the
   delivery limit's actual behaviour (below); `topic_matches` agrees with the broker on 1,584 random (pattern, key)
@@ -92,6 +94,9 @@ Erlang distribution (25673) and epmd to loopback.
 - **The RabbitMQ script** (9, each starting its own node): start/stop/status, loopback-only listeners, a busy port, a
   foreign directory left alone, a live pid that isn't the node neither signalled nor forgotten, a stale pid file, a
   symlinked directory.
+- **The PostgreSQL script** (10, on databases under a random `ORDERLY_PG_PREFIX`): create makes and migrates them
+  once, with `PYTHON=python` as CI passes it; status; drop asks, then drops only its own four; a prefix that isn't a
+  plain identifier (it goes into SQL) refused.
 - And one that the package's version matches `pyproject.toml`.
 
 Tests that need a server find it at `ORDERLY_AMQP_URL` and `ORDERLY_TEST_DATABASE_URL` (defaults: the local ones) and
