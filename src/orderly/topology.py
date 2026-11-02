@@ -49,7 +49,9 @@ def topic_matches(pattern: str, key: str) -> bool:
             return False
         return (p[0] == "*" or p[0] == k[0]) and match(p[1:], k[1:])
 
-    return match(pattern.split("."), key.split("."))
+    # The empty string is zero words, not one empty word: RabbitMQ delivers a message with key "" to a binding "" or
+    # "#", never to "*" (the day-1 review found topic_matches("*", "") was True).
+    return match(pattern.split(".") if pattern else [], key.split(".") if key else [])
 
 
 @dataclass(frozen=True)

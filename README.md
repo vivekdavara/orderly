@@ -94,8 +94,8 @@ Erlang distribution (25673) and epmd to loopback.
   message as exactly one variant, refusing what it can express, and laxer than the decoder exactly where documented.
 - **Topology** (23, on a real RabbitMQ): every type reaches exactly the queues `routes()` names; a redeclaration with
   other settings is refused; an unroutable publish is an error; rejected and poison messages are dead-lettered; the
-  delivery limit's actual behaviour (below); `topic_matches` agrees with the broker on 1,584 random (pattern, key)
-  pairs.
+  delivery limit's actual behaviour (below); `topic_matches` agrees with the broker on 1,665 (pattern, key)
+  pairs, the empty pattern and key among them.
 - **Migrations** (21) and **schemas** (31, on PostgreSQL 14): applying once and in order; a failing migration leaves
   nothing, not even the bookkeeping; edited, renamed, newer and gapped histories refused; four migrators started at
   once apply once; each invariant of DESIGN.md "Data" enforced by the database itself.

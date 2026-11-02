@@ -208,8 +208,9 @@ async def test_topic_matching_agrees_with_the_broker(channel: AbstractChannel) -
     words = ["a", "b", "c"]
     candidates = {".".join(rng.choice([*words, "*", "#"]) for _ in range(rng.randint(1, 4))) for _ in range(60)}
     # RabbitMQ 4.3 refuses a binding key with more than two '#' (PRECONDITION_FAILED).
-    patterns = sorted(pattern for pattern in candidates if pattern.split(".").count("#") <= 2)
-    keys = sorted({".".join(rng.choice(words) for _ in range(rng.randint(1, 4))) for _ in range(60)})
+    # The empty pattern and key too: zero words (the day-1 review found topic_matches wrong there).
+    patterns = sorted({""} | {pattern for pattern in candidates if pattern.split(".").count("#") <= 2})
+    keys = sorted({""} | {".".join(rng.choice(words) for _ in range(rng.randint(1, 4))) for _ in range(60)})
     exchange = await channel.declare_exchange(f"test-{uuid.uuid4().hex[:12]}.topics", "topic", auto_delete=True)
     queues = []
     for pattern in patterns:
