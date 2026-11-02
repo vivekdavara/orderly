@@ -30,7 +30,13 @@ die() { echo "postgres.sh: $*" >&2; exit 1; }
 
 q() { "$PSQL" -X -q -v ON_ERROR_STOP=1 -d postgres -Atc "$1"; }
 
-exists() { [ "$(q "SELECT 1 FROM pg_database WHERE datname = '$1'")" = 1 ]; }
+# Callers use it as a condition, where set -e is off: a failed query must end the script, not read as "missing"
+# (day-1 review, round 2: drop skipped a database it couldn't check and exited 0).
+exists() {
+  local found
+  found="$(q "SELECT 1 FROM pg_database WHERE datname = '$1'")" || die "could not check whether $1 exists"
+  [ "$found" = 1 ]
+}
 
 server_up() {
   q "SELECT 1" > /dev/null 2>&1 || die "no PostgreSQL at $PGHOST:$PGPORT (brew services start postgresql@14)"
