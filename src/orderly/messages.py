@@ -87,7 +87,11 @@ PositiveCents = Annotated[StrictInt, Field(gt=0, le=MAX_CENTS)]
 Cents = Annotated[StrictInt, Field(ge=0, le=MAX_CENTS)]
 Currency = Annotated[str, Field(strict=True, pattern=r"^[A-Z]{3}$")]
 CustomerId = Annotated[str, Field(strict=True, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$")]
-Email = Annotated[str, Field(strict=True, max_length=254, pattern=r"^[^@\s]+@[^@\s]+$")]
+# No control characters (C0, DEL, C1): PostgreSQL text can't hold NUL, so an e-mail with one would decode fine and then
+# fail its handler on every delivery instead of being refused as undecodable (day-1 review).
+Email = Annotated[
+    str, Field(strict=True, max_length=254, pattern=r"^[^@\s\x00-\x1F\x7F-\x9F]+@[^@\s\x00-\x1F\x7F-\x9F]+$")
+]
 
 
 class Payload(BaseModel):

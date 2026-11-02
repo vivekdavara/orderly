@@ -48,7 +48,7 @@
         },
         "email": {
           "maxLength": 254,
-          "pattern": "^[^@\\s]+@[^@\\s]+$",
+          "pattern": "^[^@\\s\\x00-\\x1F\\x7F-\\x9F]+@[^@\\s\\x00-\\x1F\\x7F-\\x9F]+$",
           "title": "Email",
           "type": "string"
         },
@@ -92,7 +92,7 @@
         },
         "email": {
           "maxLength": 254,
-          "pattern": "^[^@\\s]+@[^@\\s]+$",
+          "pattern": "^[^@\\s\\x00-\\x1F\\x7F-\\x9F]+@[^@\\s\\x00-\\x1F\\x7F-\\x9F]+$",
           "title": "Email",
           "type": "string"
         },
