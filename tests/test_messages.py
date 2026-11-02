@@ -309,3 +309,61 @@ def test_a_new_message_is_correlated_with_its_order() -> None:
     assert new_message(charge().payload).correlation_id == ORDER
     with pytest.raises(ValueError, match="must be the payload's order_id"):
         new_message(charge().payload, correlation_id=MESSAGE)
+
+
+def body(message_type: str, payload: dict[str, Any], **envelope: Any) -> bytes:
+    """A message of any type as JSON, with its envelope fields overridable."""
+    raw: dict[str, Any] = {
+        "message_id": str(MESSAGE),
+        "type": message_type,
+        "version": 1,
+        "occurred_at": "2026-11-02T20:15:03.123456Z",
+        "correlation_id": str(ORDER),
+        "causation_id": None,
+        "payload": {"order_id": str(ORDER), **payload},
+    }
+    raw.update(envelope)
+    return json.dumps(raw, ensure_ascii=False).encode()
+
+
+def confirmed(email: str) -> bytes:
+    return body("order.confirmed", {"customer_id": "c-1", "email": email, "total_cents": 5, "currency": "USD"})
+
+
+REFUND = {"amount_cents": 5, "currency": "USD", "reason": "payment_timeout"}
+REFUNDED = {"payment_id": str(MESSAGE), "amount_cents": 0, "currency": "USD"}
+
+
+# Each of these was accepted by a mutant of messages.py that no test caught (the day-1 review's mutation pass).
+@pytest.mark.parametrize(
+    "refused",
+    [
+        body("payment.refunded", {**REFUNDED, "amount_cents": -1}),  # Cents allowed -1
+        body("payment.refund", {**REFUND, "amount_cents": 0}),  # a refund's amount as Cents, not PositiveCents
+        body("payment.refund", {**REFUND, "currency": "US"}),  # a currency of {2,3} letters
+        body("payment.refund", REFUND, version=0),  # version > VERSION instead of !=
+        body("payment.refund", REFUND, version=-1),
+        body("payment.refund", REFUND, message_id="6f1c0c1e-6b8e-4c51-9d0e-2F1C4B0E7A10"),  # last group's case
+        body("payment.refund", REFUND, occurred_at="2026-11-02T20:15:03.12345Z"),  # fewer than six digits
+        confirmed("a" * 64 + "@" + "b" * 190),  # 255 characters
+        confirmed("a@b@example.com"),  # two @
+        confirmed("a b@example.com"),  # whitespace
+        confirmed("ab@example.com\n"),
+    ],
+)
+def test_mutation_survivors_are_refused(refused: bytes) -> None:
+    with pytest.raises(InvalidMessage):
+        decode(refused)
+
+
+def test_the_boundaries_those_survivors_sat_on_are_accepted() -> None:
+    assert MAX_CENTS == 1_000_000_000_000  # DESIGN: ten billion dollars; the schemas' CHECKs say the same literal
+    decode(confirmed("a" * 63 + "@" + "b" * 190))  # 254 characters
+    decode(body("payment.refunded", REFUNDED))  # a 0 refund
+    decode(body("payment.refund", {**REFUND, "amount_cents": 1}))
+
+
+def test_non_ascii_text_is_encoded_as_utf8_not_escaped() -> None:
+    message = decode(confirmed("zoë@example.com"))
+    assert "zoë@example.com".encode() in encode(message)
+    assert b"\\u" not in encode(message)
