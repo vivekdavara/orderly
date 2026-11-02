@@ -50,7 +50,7 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `scripts/rabbitmq.sh` | A local RabbitMQ node on 127.0.0.1:5673, kept apart from any other RabbitMQ on the machine |
 | `scripts/postgres.sh` | Creates, migrates, lists and drops Orderly's databases on the local PostgreSQL 14 (`ORDERLY_PG_PREFIX` renames them) |
 | `scripts/measure_test_fixture.py` | Times CREATE DATABASE against CREATE SCHEMA (why each test gets a schema) |
-| `tests/` | 171 tests: unit, property and integration tests against the real servers |
+| `tests/` | 213 tests: unit, property and integration tests against the real servers |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
 ## Run it
@@ -85,30 +85,37 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 171 tests in about 25 s here (more while the machine is busy):
+`make check` runs 213 tests in about 27 s here (more while the machine is busy):
 
-- **Messages** (67): the canonical bytes pinned; 39 malformed inputs, each refused for its own reason (duplicate keys,
+- **Messages** (84): the canonical bytes pinned; malformed inputs each refused for its own reason (duplicate keys,
   NaN, a full-width digit in a time, booleans and floats as integers, non-canonical UUIDs, a 5,000-digit number,
-  100,000 nested brackets...); Hypothesis round trips over all seven types; changed fields that decode or are refused,
-  never raise anything else; arbitrary bytes; the published JSON Schema matching the code, accepting every encoded
-  message as exactly one variant, refusing what it can express, and laxer than the decoder exactly where documented.
-- **Topology** (23, on a real RabbitMQ): every type reaches exactly the queues `routes()` names; a redeclaration with
-  other settings is refused; an unroutable publish is an error; rejected and poison messages are dead-lettered; the
-  delivery limit's actual behaviour (below); `topic_matches` agrees with the broker on 1,665 (pattern, key)
-  pairs, the empty pattern and key among them.
-- **Migrations** (21) and **schemas** (31, on PostgreSQL 14): applying once and in order; a failing migration leaves
-  nothing, not even the bookkeeping; edited, renamed, newer and gapped histories refused; four migrators started at
-  once apply once; each invariant of DESIGN.md "Data" enforced by the database itself.
-- **The RabbitMQ script** (9, each starting its own node): start/stop/status, loopback-only listeners, a busy port, a
-  foreign directory left alone, a live pid that isn't the node neither signalled nor forgotten, a stale pid file, a
-  symlinked directory.
-- **The service skeleton** (9): each service starts by migrating its database and declaring the topology, then
+  100,000 nested brackets, a correlation id that isn't the order, a message naming itself as its cause...); the
+  boundaries next to them accepted; Hypothesis round trips over all seven types; changed fields that decode or are
+  refused, never raise anything else; arbitrary bytes; the published JSON Schema matching the code, accepting every
+  encoded message as exactly one variant, refusing what it can express, and laxer than the decoder exactly where
+  documented.
+- **Topology** (28, on a real RabbitMQ): every type reaches exactly the queues `routes()` names; the queue arguments,
+  exchange types and durability pinned (the broker refuses a redeclaration with others); an unroutable publish is an
+  error, and `publish` refuses a channel that would only log it; rejected and poison messages are dead-lettered; the
+  delivery limit's actual behaviour (below); `delete()` leaves nothing; `topic_matches` agrees with the broker on
+  1,665 (pattern, key) pairs, the empty pattern and key among them.
+- **Migrations** (25) and **schemas** (31, on PostgreSQL 14): applying once and in order; a failing migration leaves
+  nothing, not even the bookkeeping; edited (whitespace included), renamed, newer and gapped histories refused, and
+  history read in version order whatever the storage order; four migrators started at once apply once; a connection
+  inside a transaction refused; each invariant of DESIGN.md "Data" enforced by the database itself.
+- **The service skeleton** (10): each service starts by migrating its database and declaring the topology, then
   `/health` says 200; a schema behind the code, a lost database pool, a closed broker connection each give 503 naming
-  the problem; edited migration history or an unreachable broker stops the start.
-- **The PostgreSQL script** (10, on databases under a random `ORDERLY_PG_PREFIX`): create makes and migrates them
-  once, with `PYTHON=python` as CI passes it; status; drop asks, then drops only its own four; a prefix that isn't a
-  plain identifier (it goes into SQL) refused.
+  the problem; edited migration history or an unreachable broker stops the start; a pool that can't fill is closed.
+- **The scripts**: `rabbitmq.sh` (9, each starting its own node: start/stop/status, loopback-only listeners, a busy
+  port, a foreign directory left alone, a live pid that isn't the node neither signalled nor forgotten, a stale pid
+  file, a symlinked directory) and `postgres.sh` (10, on databases under a random `ORDERLY_PG_PREFIX`: create makes
+  and migrates them once, with `PYTHON=python` as CI passes it; status; drop asks, then drops only its own four; a
+  prefix that isn't a plain identifier refused).
+- **The review's tests** (15, `tests/review_d1/`): each failed on the code it was written against and passes now.
 - And one that the package's version matches `pyproject.toml`.
+
+A full run leaves nothing behind on the shared servers (no queue, exchange, schema or database; checked after a run
+with `rabbitmqctl list_queues` / `list_exchanges` and `pg_namespace` / `pg_database`).
 
 Tests that need a server find it at `ORDERLY_AMQP_URL` and `ORDERLY_TEST_DATABASE_URL` (defaults: the local ones) and
 are skipped when it isn't there, except with `ORDERLY_REQUIRE_SERVICES=1` (CI sets it), where a missing server fails
@@ -129,6 +136,28 @@ Measured on an Apple M3 laptop (macOS 26.6.2, on battery), PostgreSQL 14.20, Rab
 The second row is the day's most useful finding: on RabbitMQ 4, requeueing a message is "released", not "failed",
 so a consumer that requeues on a transient error would loop forever without the delivery limit ever stopping it. The
 retries (day 3) therefore never requeue: they go through wait queues with their own attempt count.
+
+## Review of day 1
+
+One review agent, in its own git worktree, read the code at `5edf504` (15:33-15:48) with a correctness brief and
+wrote each finding as a failing test (`tests/review_d1/`). Seven defects, all fixed:
+
+| Defect | Fix |
+|---|---|
+| CI's last step could never pass: `postgres.sh` tested `[ -x "$PYTHON" ]`, false for `PYTHON=python` (a clean-clone rehearsal of the CI steps found it too) | `5f21e1e` |
+| `postgres.sh create` and `drop` exited 0 after a failed statement (`q ... && echo`: `set -e` ignores the left of `&&`) | `d30e814` |
+| The dead-letter queues had RabbitMQ 4's default delivery limit (20) and nothing behind them: a message whose inspector crashed on it 21 times was dropped | `b71cc16` |
+| Under `default_transaction_isolation = 'repeatable read'` a migrator that waited for the lock didn't see the other's work and failed with DuplicateTable | `073733b` |
+| `topic_matches` treated the empty routing key as one word, unlike RabbitMQ | `b82315e` |
+| An e-mail with NUL or another control character decoded, then could never be stored | `c1f5ed1` |
+| A `correlation_id` other than the payload's `order_id` decoded | `bf15f1a` |
+
+Its mutation pass left 17 non-equivalent survivors in `messages.py`, `topology.py` and `migrate.py`; each now has a
+test, and each mutant was re-applied and fails it (`2d43faa`, `dcdd337`). Its suspicions (a self-caused message,
+`publish` on a channel that only logs returns, `lsof | grep -q` under `pipefail`, a test that could leak an exchange)
+were settled in `3c83729`. What held: no input made `decode` raise anything but `InvalidMessage`; the round trip held
+for years 1 to 9999; the routing, the confirmed mandatory publish and both delivery-limit claims; the history checks
+under READ COMMITTED; the scripts refusing what isn't theirs.
 
 ## Design decisions
 
@@ -151,6 +180,9 @@ retries (day 3) therefore never requeue: they go through wait queues with their 
   service are day 2, payment and notification day 3.
 - The RabbitMQ script tests run only where RabbitMQ is installed; CI uses a service container and skips them.
 - One RabbitMQ node: quorum queues are replicated only on a cluster, which this project doesn't run.
+- The orders schema checks e-mails with PostgreSQL's `[:space:]`, the messages with Rust's `\s`; they differ on
+  U+0085 (locale-dependent), so the database could hold an e-mail no `order.confirmed` can carry. The order service
+  (day 2) will validate requests with the message types, leaving the database check as the backstop.
 
 ## License
 

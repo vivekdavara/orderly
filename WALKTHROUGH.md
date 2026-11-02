@@ -127,7 +127,16 @@ server into a failure.
 **How do you know the tests can fail?**
 For the checks that matter most I removed the code and ran the tests: without the advisory lock the four-migrator test
 fails; comparing only names (not SHA-256) fails the edited-history test; without the open-log-file proof in
-`rabbitmq.sh` the stranger-pid test fails.
+`rabbitmq.sh` the stranger-pid test fails. The review's mutation pass then found 17 changes nothing caught; each has a
+test now and fails it.
+
+## The services (skeleton)
+
+**What does a service do before it has any logic?**
+`service.py`: at startup it migrates its own database (the advisory lock covers several instances starting together)
+and declares the topology; if either fails, it doesn't start. `/health` is 200 only when the database answers within
+2 s at the migration this code expects and the broker connection is open, and 503 naming each problem otherwise, so
+a load balancer never sends traffic to an instance running against a stale schema.
 
 ## The scripts
 
@@ -137,6 +146,24 @@ port; the script uses its own config and no plugins), listening beyond loopback 
 to 127.0.0.1), and pid reuse: a live pid in a pid file proves nothing after a crash or reboot. RabbitMQ 4 reads its
 directories from the environment, not the command line, so the proof that a pid is this directory's node is that it
 holds this directory's log file open (`lsof`).
+
+## The review
+
+**What did the review find?**
+A separate agent read the day-1 code with a correctness brief and wrote each finding as a failing test
+(`tests/review_d1/`). Seven defects. The two I'd lead with: the dead-letter queues, the last stop, had RabbitMQ 4's
+default delivery limit and nothing behind them, so a message an inspector crashed on 21 times vanished (now `-1`, no
+limit); and the migrator's advisory lock didn't protect a database whose default isolation is REPEATABLE READ,
+because the snapshot was taken by the lock statement before the lock was granted, so a migrator that waited didn't
+see the other's work (now the transaction pins READ COMMITTED first). The others: CI's last step could never pass, the
+PostgreSQL script reported success after a failed statement (`set -e` ignores the left of `&&`), the empty routing key,
+control characters in e-mails, a correlation id that wasn't the order.
+
+**And the mutation pass?**
+It changed one thing at a time in the three core modules and found 17 changes no test noticed: boundaries
+(`MAX_CENTS`, 254 characters, a zero refund), spellings (uppercase in a UUID's last group, five fractional digits),
+the queue arguments, exchange types, whitespace-only edits to a migration. Each has a test now, and I re-applied each
+mutant to see it fail.
 
 ## What went wrong on day 1
 
@@ -148,6 +175,11 @@ holds this directory's log file open (`lsof`).
 - The script tests' port picker asked the OS for a port and added 20,000 for the distribution port: macOS's ephemeral
   ports start at 49152, so there was never room.
 - A commit message claimed 2,000+ pairs for the topic differential; it was 1,584 (corrected in the README's commit).
+- I started the service once against the local broker before the dead-letter fix, so the real queues existed with the
+  old arguments and the next start would have been refused as drift (which is the point of declaring at startup). I
+  deleted the empty queues and redeclared them.
+- My own reading of the service skeleton found a pool left retrying in the background when its first connections
+  timed out at startup: `open()` sat before the `try` whose `finally` closes it.
 
 ## What's next
 
