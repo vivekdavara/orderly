@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
@@ -115,3 +116,12 @@ class FakeMailer:
         if self.down or fraction(order_id, f"mail:{self.attempts[order_id]}") < self.failure_ratio:
             raise MailerUnavailable(f"could not send {email.subject!r} to {email.recipient}")
         self.sent.append(email)
+
+
+def provider_from_environment() -> FakeProvider:
+    """ORDERLY_PROVIDER_LATENCY_MS, ORDERLY_PROVIDER_DECLINE_RATIO and ORDERLY_PROVIDER_ERROR_RATIO (defaults 0)."""
+    return FakeProvider(
+        latency=float(os.environ.get("ORDERLY_PROVIDER_LATENCY_MS", "0")) / 1000,
+        decline_ratio=float(os.environ.get("ORDERLY_PROVIDER_DECLINE_RATIO", "0")),
+        error_ratio=float(os.environ.get("ORDERLY_PROVIDER_ERROR_RATIO", "0")),
+    )

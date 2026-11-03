@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 
-import httpx
 import psycopg
 import psycopg.conninfo
 import pytest
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter
+from helpers import running
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from orderly import service
@@ -18,15 +16,6 @@ from orderly.broker import amqp_url
 from orderly.migrate import Migration, MigrationError, migrate
 from orderly.service import PORTS, Resources, Settings, create_app
 from orderly.topology import Topology
-
-
-@asynccontextmanager
-async def running(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
-    """The app with its lifespan started (httpx's ASGI transport doesn't run lifespans), and a client for it."""
-    async with app.router.lifespan_context(app):
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://orderly.test") as client:
-            yield client
 
 
 def settings(fresh_database: str, topology: Topology, service: str = "orders") -> Settings:

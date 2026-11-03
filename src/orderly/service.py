@@ -42,7 +42,7 @@ HEALTH_TIMEOUT = 2.0
 # How long shutdown waits for the workers to finish after asking them to stop, before cancelling them.
 STOP_TIMEOUT = 10.0
 # The module whose create_app builds each service's app; the others are the bare skeleton until they have one.
-BUILDERS: dict[str, str] = {}
+BUILDERS = {"monolith": "orderly.monolith"}
 
 log = logging.getLogger(__name__)
 
