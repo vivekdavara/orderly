@@ -15,21 +15,17 @@ strongly consistent, and it has the problems the split exists to fix, which the 
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
 
-from fastapi import APIRouter, FastAPI, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 
-from orderly import emails, ordering
+from orderly import emails, order_api, ordering
 from orderly.fakes import FakeMailer, FakeProvider, MailerUnavailable, ProviderUnavailable, provider_from_environment
-from orderly.ordering import Connection, OrderRefused, OrderRequest, Reserved
-from orderly.service import Resources, Settings
+from orderly.ordering import Connection, OrderRequest, Reserved
+from orderly.service import Settings
 from orderly.service import create_app as create_service_app
 
 # A declined charge is a failed request: the order exists (cancelled), and the response says payment is required.
 STATUS_CODES = {"CONFIRMED": 201, "CANCELLED": 402}
-
-IdempotencyKey = Annotated[str | None, Header(pattern=ordering.IDEMPOTENCY_KEY.pattern)]
 
 
 def create_app(
@@ -92,40 +88,17 @@ def create_app(
             (order_id, kind, email.recipient, email.subject, email.body),
         )
 
-    router = APIRouter()
-
-    @router.post("/orders")
-    async def place_order(request: Request, body: OrderRequest, idempotency_key: IdempotencyKey = None) -> JSONResponse:
-        resources: Resources = request.app.state.resources
-
+    def write_for(body: OrderRequest, key: str | None) -> ordering.Write:
         async def write(conn: Connection, order_id: uuid.UUID, reserved: Reserved) -> None:
-            await charge_and_decide(conn, order_id, reserved, body, idempotency_key)
+            await charge_and_decide(conn, order_id, reserved, body, key)
 
-        try:
-            taken = await ordering.take_order(resources.pool, body, idempotency_key, write)
-        except OrderRefused as refused:
-            return JSONResponse({"detail": refused.detail}, status_code=refused.status)
-        except (ProviderUnavailable, MailerUnavailable) as error:
-            which = "payment_provider_unavailable" if isinstance(error, ProviderUnavailable) else "mailer_unavailable"
-            return JSONResponse(
-                {"detail": {"error": which, "message": str(error)}}, status_code=503, headers={"Retry-After": "1"}
-            )
-        headers = {"Location": f"/orders/{taken.order.id}"}
-        if taken.replayed:
-            headers["Idempotent-Replayed"] = "true"
-        return JSONResponse(
-            taken.order.model_dump(mode="json"), status_code=STATUS_CODES[taken.order.status], headers=headers
-        )
+        return write
 
-    @router.get("/orders/{order_id}")
-    async def get_order(request: Request, order_id: uuid.UUID) -> JSONResponse:
-        resources: Resources = request.app.state.resources
-        async with resources.pool.connection() as conn:
-            order = await ordering.read_order(conn, order_id)
-        if order is None:
-            return JSONResponse({"detail": {"error": "not_found", "message": f"no order {order_id}"}}, status_code=404)
-        return JSONResponse(order.model_dump(mode="json"))
-
+    router = order_api.router(
+        write_for,
+        status_code=lambda order: STATUS_CODES[order.status],
+        unavailable={ProviderUnavailable: "payment_provider_unavailable", MailerUnavailable: "mailer_unavailable"},
+    )
     app = create_service_app(settings, router=router)
     app.state.provider = provider
     app.state.mailer = mailer
