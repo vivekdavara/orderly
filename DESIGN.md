@@ -53,7 +53,52 @@ It is simple and strongly consistent, and that is why it is the baseline. Its pr
 - Every part fails together. If sending the e-mail fails, the order fails (or the code grows special cases).
 - Everything deploys and scales together; the payment code and the order code share one schema.
 
-The monolith stays in the repo as the reference: the load test (day 4) runs the same orders through both.
+The monolith stays in the repo as the reference: the load test (day 4) runs the same orders through both. It has the
+same API as the order service and takes its port (8112), so a client points at :8112 either way.
+
+What it does, as built (`orderly.monolith`):
+
+- The order row is inserted **before** the provider is called, as `AWAITING_PAYMENT` (no other transaction ever sees
+  that state): inserting it claims the idempotency key, so a concurrent retry with the same key waits on the key's
+  unique index instead of charging the customer a second time. Then the payment is recorded, the order confirmed (or
+  cancelled with its stock released), the e-mail sent through the fake mailer, and the notification recorded.
+- `201` confirmed, `402` declined (the order exists, cancelled), `409` out of stock, `422` a request it can't take,
+  `503` with `Retry-After` when the provider or the mailer fails (everything rolled back).
+
+Writing it made the second problem concrete, and the tests pin it rather than hide it: **a failure after the charge**
+(the mailer, or the commit itself) rolls the order back but not the charge, so the customer is charged for an order
+that doesn't exist; and since no order was committed, the client's retry with the same key is a new order with a new
+id, which the provider (idempotent by order id) charges again. One order, two charges. The split fixes it by giving the
+charge its own durable record in the payment service and making every later step a retried message instead of part of
+one request. The first problem is pinned too: two orders for one product take two provider latencies end to end, two
+orders for different products overlap.
+
+## Taking an order (day 2)
+
+The part of the monolith the order service keeps (`orderly.ordering`), shared by both:
+
+- **The request** is validated with the message types (`CustomerId`, `Email`), so an order the API accepts can always
+  be put into `payment.charge` and `order.confirmed`; 1-50 lines, each sku once, quantities 1-1000. Prices come from
+  the catalogue, never from the client. The database's own checks stay as the backstop.
+- **An Idempotency-Key** (1-200 visible ASCII characters) makes a retry safe. The same key with the same request (same
+  SHA-256 of its canonical JSON) returns the order the first one created, as it is now, with
+  `Idempotent-Replayed: true`; with a different request, `422 idempotency_key_reused`. Two requests with one key at once
+  make one order: the second blocks on the key's unique index until the first commits, gets a unique violation, rolls
+  back (its reservation with it) and replays the first. And **after an out-of-stock refusal the key is checked again**: a
+  retry that waited for the stock its own first attempt took gets that order, not a 409.
+- **Stock** is reserved line by line in sku order with `UPDATE products SET stock = stock - q WHERE sku = $1 AND stock
+  >= q RETURNING price_cents, currency`: every transaction locks products in the same order, so orders sharing products
+  wait instead of deadlocking (a test locks four products in random request orders across 40 concurrent orders;
+  locking in request order deadlocks within a few), and `stock >= q` is re-evaluated after a wait, so stock never goes
+  negative. The unit price is the locked row's. All lines must share one currency, and the total stay within 10^12
+  cents (both `422`).
+- Every pooled connection is **pinned to READ COMMITTED**: the reservation relies on re-evaluating `stock >= q` after a
+  wait, which REPEATABLE READ would turn into a serialization failure.
+
+The order service's write after the reservation: the order as `AWAITING_PAYMENT` with `payment_deadline = now() +
+timeout` (30 s by default), its lines, and `payment.charge` (the order's total, the order id as correlation) to the
+outbox, all in the request's transaction; it answers `201` at once. Nothing in the request touches the broker, so orders
+are still taken while RabbitMQ is down: their commands wait in the outbox.
 
 ## The split
 
@@ -254,6 +299,28 @@ the routing lives in one place.
   order and nothing relies on one. Within one order the saga only writes its next message after consuming the reply
   to the previous one, so one order's messages are causally ordered anyway.
 - `LISTEN/NOTIFY` wakes the relay when a row is written; it also polls, so a lost notification only delays.
+
+As built (`orderly.outbox`, day 2):
+
+- A batch is **published all at once, then confirmed**: every message of the batch goes out before any confirm is
+  awaited, so a batch costs about one round trip, not one per message. Rows whose publish failed (returned as
+  unroutable, or no confirm within `publish_timeout`, 10 s) stay unpublished and are reported as one `RelayError`; the
+  rest of the batch is still marked. A test unbinds a queue: its row stays, the other row of the batch is marked, and
+  the next batch after the binding returns publishes it.
+- **The loop**: `wake` is cleared before each batch (a NOTIFY while a batch runs means another pass); a full batch goes
+  straight to the next; otherwise it waits for a NOTIFY, the poll interval (1 s) or the stop. Database and broker
+  errors back off from 0.1 s, doubling to 5 s. The listener has its own connection, sets `wake` once right after
+  `LISTEN` (a row committed before it took effect notified no one), and reconnects after a lost connection while
+  polling covers the gap. Anything else (a bug) ends the relay, and `/health` says so.
+- **A stop** comes through the service skeleton: shutdown sets the workers' stop event and waits for them (up to 10 s)
+  before cancelling. A test stops the relay mid-batch; the batch is still marked.
+- **Two ways the relay died, found by running it inside the order service and fixed**: aiormq raises `CancelledError`
+  into whoever awaits an RPC when the connection closes under it (the relay was opening its channel), though nothing
+  cancelled the relay's task; and while a robust connection reconnects, opening a channel raises a bare `RuntimeError`.
+  The relay now treats a `CancelledError` as a broker error unless its own task is being cancelled
+  (`Task.cancelling()`), and turns that one call's `RuntimeError` into a `ConnectionError`. A test drops the
+  connection under a running order service: the robust connection reconnects (the test sets `reconnect_interval=0.5`;
+  aio-pika's default is 5 s) and the relay publishes the orders taken meanwhile.
 
 ## Idempotent consumers (day 3)
 
