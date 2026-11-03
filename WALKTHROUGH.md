@@ -1,8 +1,8 @@
 # Orderly: walkthrough
 
 The questions an interviewer is likely to ask about this project, with short answers grounded in the code. Day 1
-covers the design, the message contracts, the RabbitMQ topology, the migrations and the scripts; later days add the
-services.
+covers the design, the message contracts, the RabbitMQ topology, the migrations and the scripts; day 2 the monolith,
+taking an order, the order service and the outbox; later days add the other services.
 
 ## The project
 
@@ -138,6 +138,100 @@ and declares the topology; if either fails, it doesn't start. `/health` is 200 o
 2 s at the migration this code expects and the broker connection is open, and 503 naming each problem otherwise, so
 a load balancer never sends traffic to an instance running against a stale schema.
 
+## The monolith and taking an order (day 2)
+
+**Walk me through the monolith's POST /orders.**
+`monolith.py`, one transaction: replay the Idempotency-Key if it was used (`ordering.take_order`), reserve each line's
+stock in sku order, insert the order as AWAITING_PAYMENT and its lines, call the fake provider, record the payment,
+confirm (or cancel and release the stock), send the e-mail, record it, commit. 201 confirmed, 402 declined, 409 out of
+stock, 503 if the provider or mailer fails.
+
+**Why insert the order before charging, if nobody can see it until the commit anyway?**
+Because inserting it claims the idempotency key. A retry with the same key that arrives while the first is still
+talking to the provider blocks on the key's unique index, and after the first commits it gets a unique violation and
+replays the first order. If the insert came after the charge, both requests would charge the customer before either
+reached the index.
+
+**What is actually wrong with the monolith? Show me, don't tell me.**
+Two tests in `tests/test_monolith.py` pin it. `..._a_failure_after_the_charge_keeps_the_charge_and_the_retry_charges_again`:
+the mailer is down, the transaction rolls back after the provider approved the charge, so the customer is charged
+for an order that doesn't exist; the client retries with the same key, but no order was committed to replay, so the
+retry is a new order with a new id, and the provider charges again. `..._the_providers_latency_is_paid_with_the_rows_locked`:
+two orders for one product take two provider latencies end to end, because the second waits for the first's row
+lock; for different products they overlap. `scripts/measure_intake.py` puts numbers on the second one (README
+"Results (day 2)").
+
+**How does an Idempotency-Key work, exactly?**
+`ordering.take_order`. Same key and same request (SHA-256 of its canonical JSON): the order the first request made, as
+it is now, with `Idempotent-Replayed: true`. Same key, different request: 422. Two at once: one waits on the unique
+index and replays the other. The case that's easy to miss: a retry that waited for the stock its own first attempt took
+finds no stock. Without a second look at the key it would answer 409 to a request that succeeded; `take_order` checks
+the key again after an out-of-stock refusal (`test_a_retry_that_waited_for_the_last_unit_gets_the_order_not_a_409`).
+
+**How do you stop overselling, and why can't two orders deadlock?**
+`ordering.reserve`: `UPDATE products SET stock = stock - q WHERE sku = $1 AND stock >= q`. The row lock serializes
+orders for one product, and under READ COMMITTED the `stock >= q` is re-evaluated after the wait, so the loser gets no
+row and a 409. Deadlock: every transaction locks its products in sku order, whatever order the request lists them in,
+so no two can wait on each other in a cycle. A test sends 40 concurrent orders listing the same four products in random
+orders; I changed the code to lock in request order and the test failed with `DeadlockDetected`.
+
+**Why pin READ COMMITTED?**
+The reservation depends on re-checking `stock >= q` after waiting for another transaction's lock. Under REPEATABLE READ
+that re-check would fail the transaction with a serialization error instead. The pool's `configure` callback sets it on
+every connection, so a database whose default is something else doesn't change behaviour (tested with a connection
+defaulting to REPEATABLE READ).
+
+**What does the order service do differently?**
+`orders.py`: the same order-taking code, then instead of calling the provider it writes `payment.charge` to its outbox
+in the same transaction and answers 201 with the order AWAITING_PAYMENT. Nothing in the request touches the broker:
+a test closes the broker connection and orders are still taken, their commands waiting in the outbox.
+
+## The outbox (day 2)
+
+**Why an outbox? Why not publish after the commit?**
+Publish after commit: a crash between the two loses the message, and the order waits forever. Publish before commit:
+a rollback after it sends a command for an order that doesn't exist. Writing the message in the order's own
+transaction makes "the order exists" and "the command will be sent" the same fact; the relay turns it into a publish
+afterwards, at least once.
+
+**Walk me through the relay.**
+`outbox.Relay.publish_batch`: in one transaction, claim up to 100 unpublished rows in id order `FOR UPDATE SKIP
+LOCKED`; publish all of them on a confirming channel, then wait for the confirms (10 s at most); mark the confirmed
+ones published; commit. `run` repeats it, sleeping between batches until a NOTIFY (sent by `outbox.write`, delivered
+on commit), the 1 s poll, or the stop. Errors back off from 0.1 s to 5 s.
+
+**Can a message be lost? Published twice?**
+Lost: no; a row is marked only after its confirm, and only in the transaction that claimed it. Twice: yes, by design,
+when the relay crashes (or its database connection dies) after publishing and before the mark commits. The test
+`test_a_crash_before_the_mark_publishes_the_batch_again_with_the_same_ids` shows the batch arriving twice, byte for
+byte, so with the same `message_id`: that's what the consumers (day 3) deduplicate on.
+
+**What does SKIP LOCKED buy?**
+Two relays (two instances of a service) take different rows instead of the second waiting for the first's batch or
+both publishing the same rows. The test runs two relays over 600 rows and gets each exactly once; without `SKIP
+LOCKED` it fails.
+
+**What if one message can't be published?**
+It stays, the rest of its batch is marked, and the batch raises `RelayError` so the loop backs off. The test unbinds a
+queue: that row stays, the other is marked, and after the binding returns the next batch publishes it.
+
+**Why publish a whole batch before waiting for any confirm?**
+One round trip per batch instead of per message. `scripts/measure_relay.py` measures it (README "Results (day 2)").
+
+**What does "a stop never cancels a mark" mean in code?**
+The relay checks its stop event only between batches; the service skeleton's shutdown sets the event and waits up to
+10 s for the workers before cancelling anything. A test stops the relay while a batch is being published: the batch
+still gets marked, so the next start doesn't send it again.
+
+**How did the relay die, and what did you change?**
+Two ways, both found running it inside the order service. aiormq raises `CancelledError` into whoever is awaiting an
+RPC when the connection closes under it (the relay was opening its channel), though nothing cancelled the relay's
+task, so the relay ended as if cancelled. And while a robust connection reconnects, opening a channel raises a bare
+`RuntimeError`. The relay now treats a `CancelledError` as a broker error unless its own task is being cancelled
+(`Task.cancelling()`, Python 3.11), and turns that one call's `RuntimeError` into a `ConnectionError`. A test drops the
+connection under a running order service and checks the outbox drains after the reconnect; another checks that a real
+cancel still ends the relay. And `/health` reports a worker that has died, so the next unknown way would be visible.
+
 ## The scripts
 
 **What does `rabbitmq.sh` guard against?**
@@ -191,8 +285,19 @@ mutant to see it fail.
 - My own reading of the service skeleton found a pool left retrying in the background when its first connections
   timed out at startup: `open()` sat before the `try` whose `finally` closes it.
 
+## What went wrong on day 2
+
+- The order view refused PostgreSQL's timestamps: psycopg returns `timestamptz` in the session's time zone (New York
+  here) and the API's time type accepts only UTC. Converted at the read.
+- Pydantic searches for a header's `pattern` rather than matching it whole, so `Idempotency-Key: has space` passed an
+  unanchored pattern. Anchored now, and the same pattern is used with `fullmatch`.
+- The relay died twice under aio-pika (above); the first time, `/health` reported the dead relay as "stopped" because a
+  task ended by a `CancelledError` counts as cancelled.
+- RabbitMQ's `list_queues` showed `payment.commands` empty right after the order service's smoke run had published to
+  it: a quorum queue's counters lag by a few seconds. Fetching from the queue showed the command.
+
 ## What's next
 
-Day 2: the monolith (`orderly_monolith`, one transaction per order), the order service extracted from it, events
-through RabbitMQ, and the outbox relay (claim in id order with `SKIP LOCKED`, publish with confirms, mark, never cancel
-a mark on stop).
+Day 3: the payment and notification services (their consumers and the payment service's outbox), the saga's
+transition function and its consumer in the order service, the deadline sweeper, idempotent consumers
+(`processed_messages`), dead letters and retries with backoff through wait queues.
