@@ -6,6 +6,7 @@ import asyncio
 import time
 import uuid
 from collections.abc import AsyncIterator
+from datetime import timedelta
 from typing import Any
 
 import psycopg
@@ -185,8 +186,18 @@ async def test_an_unroutable_row_stays_and_the_rest_of_its_batch_is_marked(
         await relay(pool, connection, topology).publish_batch()
     assert await drain(channel, topology.queue("notification.order-events"), 1) == [encode(event)]
     assert await unpublished(pool) == 1
-    # Once the binding is back, the next batch publishes it.
+    async with pool.connection() as conn:
+        row = await (
+            await conn.execute("SELECT attempts, last_error, next_attempt_at - now() FROM outbox WHERE id = 1")
+        ).fetchone()
+    assert row is not None
+    attempts, last_error, wait = row
+    assert attempts == 1 and last_error.startswith("PublishError: ") and "NO_ROUTE" in last_error
+    assert timedelta(seconds=0.4) < wait <= timedelta(seconds=0.5)
+    # Once the binding is back, the first batch after the row's retry time publishes it; before it, none claims it.
     await commands_queue.bind(topology.commands, "payment.charge")
+    assert await relay(pool, connection, topology).publish_batch() == 0
+    await asyncio.sleep(0.6)
     assert await relay(pool, connection, topology).publish_batch() == 1
     assert await drain(channel, topology.queue("payment.commands"), 1) == [encode(stuck)]
 
@@ -391,3 +402,33 @@ async def test_a_lost_listener_reconnects_and_a_row_written_meanwhile_goes_out_a
         stop.set()
         await asyncio.wait_for(task, timeout=5)
     await drain(channel, topology.queue("payment.commands"), 2)
+
+
+async def test_a_failing_rows_retry_wait_doubles_from_half_a_second_to_a_minute(
+    pool: AsyncConnectionPool, connection: AbstractConnection, channel: AbstractChannel, topology: Topology
+) -> None:
+    commands_queue = await channel.get_queue(topology.queue("payment.commands"), ensure=False)
+    await commands_queue.unbind(topology.commands, "payment.charge")
+    await write_all(pool, [charge()])
+    r = relay(pool, connection, topology)
+    waits = []
+    attempts = 0
+    for _ in range(10):
+        with pytest.raises(RelayError):
+            await r.publish_batch()
+        async with pool.connection() as conn:
+            row = await (
+                await conn.execute("SELECT extract(epoch FROM next_attempt_at - now()), attempts FROM outbox")
+            ).fetchone()
+            assert row is not None
+            waits.append(round(float(row[0]), 1))
+            attempts = int(row[1])
+            await conn.execute("UPDATE outbox SET next_attempt_at = now()")  # skip the wait
+    assert waits == [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 60.0]
+    assert attempts == 10
+
+
+def test_last_error_holds_no_nul_and_at_most_1000_characters() -> None:
+    assert outbox.describe(ValueError("bad\x00byte")) == "ValueError: bad\\0byte"
+    long = outbox.describe(ValueError("é" * 2000))
+    assert len(long) == 1000 and long.startswith("ValueError: éé")

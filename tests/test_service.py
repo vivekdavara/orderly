@@ -13,7 +13,7 @@ from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from orderly import service
 from orderly.broker import amqp_url
-from orderly.migrate import Migration, MigrationError, migrate
+from orderly.migrate import Migration, MigrationError, migrate, migrations
 from orderly.service import PORTS, Resources, Settings, create_app
 from orderly.topology import Topology
 
@@ -30,15 +30,17 @@ async def test_a_started_service_has_migrated_and_is_healthy(
     async with running(app) as client:
         response = await client.get("/health")
         assert response.status_code == 200, response.text
+        latest = len(migrations(service))
         assert response.json() == {
             "service": service,
-            "schema_expected": 1,
-            "schema": 1,
+            "schema_expected": latest,
+            "schema": latest,
             "status": "ok",
             "problems": {},
         }
     with psycopg.connect(fresh_database) as conn:
-        assert conn.execute("SELECT version FROM schema_migrations").fetchall() == [(1,)]
+        versions = conn.execute("SELECT version FROM schema_migrations ORDER BY 1").fetchall()
+    assert versions == [(v,) for v in range(1, latest + 1)]
 
 
 async def test_a_schema_behind_the_code_is_unhealthy(fresh_database: str, topology: Topology) -> None:
@@ -48,7 +50,7 @@ async def test_a_schema_behind_the_code_is_unhealthy(fresh_database: str, topolo
             conn.execute("DELETE FROM schema_migrations")
         response = await client.get("/health")
     assert response.status_code == 503
-    assert response.json()["problems"] == {"schema": "database at migration None, this code expects 1"}
+    assert response.json()["problems"] == {"schema": "database at migration None, this code expects 2"}
 
 
 async def test_a_lost_database_is_unhealthy(fresh_database: str, topology: Topology) -> None:
@@ -163,10 +165,10 @@ async def test_a_schema_ahead_of_the_code_is_unhealthy_too(fresh_database: str, 
     app = create_app(settings(fresh_database, topology))
     async with running(app) as client:
         with psycopg.connect(fresh_database, autocommit=True) as conn:
-            conn.execute("INSERT INTO schema_migrations (version, name, sha256) VALUES (2, 'next', 'x')")
+            conn.execute("INSERT INTO schema_migrations (version, name, sha256) VALUES (3, 'next', 'x')")
         response = await client.get("/health")
     assert response.status_code == 503
-    assert response.json()["problems"] == {"schema": "database at migration 2, this code expects 1"}
+    assert response.json()["problems"] == {"schema": "database at migration 3, this code expects 2"}
 
 
 # Day 2: the brokerless monolith, the pinned isolation level, and background workers.

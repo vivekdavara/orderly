@@ -75,11 +75,11 @@ def test_create_makes_and_migrates_the_databases_once(script: Script) -> None:
     names = {f"{script.prefix}_{suffix}" for suffix in ("orders", "payments", "notifications", "monolith", "test")}
     assert databases(script.url, script.prefix) == names
     assert f"{script.prefix}_orders created" in first.stdout
-    assert "orders: applied [1], now at 1" in first.stdout
+    assert "orders: applied [1, 2], now at 2" in first.stdout
     second = script.run("create")
     assert second.returncode == 0, second.stderr
     assert f"{script.prefix}_orders exists" in second.stdout
-    assert "orders: up to date at 1" in second.stdout
+    assert "orders: up to date at 2" in second.stdout
 
 
 def test_status_reports_each_database(script: Script) -> None:
@@ -88,8 +88,8 @@ def test_status_reports_each_database(script: Script) -> None:
     script.run("create")
     after = script.run("status").stdout.splitlines()
     assert after == [
-        f"{script.prefix}_orders: migration 1",
-        f"{script.prefix}_payments: migration 1",
+        f"{script.prefix}_orders: migration 2",
+        f"{script.prefix}_payments: migration 2",
         f"{script.prefix}_notifications: migration 1",
         f"{script.prefix}_monolith: migration 1",
         f"{script.prefix}_test: present (tests make a schema each)",

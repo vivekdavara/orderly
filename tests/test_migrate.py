@@ -59,10 +59,10 @@ def test_load_refuses_a_folder_that_isnt_a_clean_sequence(tmp_path: Path, files:
 
 def test_migrate_applies_everything_once(fresh_database: str) -> None:
     with psycopg.connect(fresh_database, autocommit=True) as conn:
-        assert migrate(conn, "orders") == [1]
+        assert migrate(conn, "orders") == [1, 2]
         assert migrate(conn, "orders") == []
     assert {"products", "orders", "order_lines", "outbox", "processed_messages"} <= tables(fresh_database)
-    assert recorded(fresh_database) == [(1, "initial")]
+    assert recorded(fresh_database) == [(1, "initial"), (2, "outbox_retries")]
 
 
 @pytest.mark.parametrize("service", SERVICES)
@@ -149,7 +149,7 @@ def test_the_command_line(fresh_database: str, capsys: pytest.CaptureFixture[str
         conn.execute("UPDATE schema_migrations SET sha256 = 'edited'")
     assert main(["payments", "--url", fresh_database]) == 1
     out, err = capsys.readouterr()
-    assert out.splitlines() == ["payments: applied [1], now at 1", "payments: up to date at 1"]
+    assert out.splitlines() == ["payments: applied [1, 2], now at 2", "payments: up to date at 2"]
     assert "payments: migration 1 was applied as initial with SHA-256 edited..." in err
 
 
@@ -159,7 +159,7 @@ def test_a_connection_inside_a_transaction_is_refused(fresh_database: str) -> No
         with pytest.raises(MigrationError, match="outside any transaction"):
             migrate(conn, "orders")
         conn.rollback()
-        assert migrate(conn, "orders") == [1]  # idle again: fine, even without autocommit
+        assert migrate(conn, "orders") == [1, 2]  # idle again: fine, even without autocommit
 
 
 # The rest kill mutants of migrate.py that the day-1 review found no test noticed.

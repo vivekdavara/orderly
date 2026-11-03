@@ -9,8 +9,9 @@ afterwards:
 3. mark the confirmed ones published, in the claim's transaction, and commit.
 
 A crash between 2 and 3 publishes those rows again with the same message ids: at least once, which is why consumers
-deduplicate. A row whose publish failed (unroutable, no confirm) stays unpublished and is retried with the next batch;
-the others in its batch are still marked.
+deduplicate. A row whose publish failed (unroutable, no confirm) stays unpublished with its attempt count, its error
+and a time before which it isn't claimed again (0.5 s, doubling to a minute); the others in its batch are still
+marked, and the claims after it go on to the rows behind it.
 
 `Relay.run` repeats that until its stop event is set, checking the event only between batches, so a stop never
 interrupts a batch between publishing it and marking it. It sleeps between batches until a NOTIFY from `write` (on
@@ -37,8 +38,12 @@ from orderly.topology import Topology
 
 # The LISTEN/NOTIFY channel. One per database, and each service has its own database.
 CHANNEL = "orderly_outbox"
+# The relay's backoff after an error outside a batch's publishes (the database, the broker connection).
 MIN_BACKOFF = 0.1
 MAX_BACKOFF = 5.0
+# A failed row's own wait before its next attempt: 0.5 s after the first failure, doubling, at most a minute.
+ROW_RETRY_FIRST = 0.5
+ROW_RETRY_MAX = 60.0
 
 log = logging.getLogger(__name__)
 
@@ -54,12 +59,19 @@ async def write(conn: psycopg.AsyncConnection[Any], message: Message) -> None:
 
 
 class RelayError(Exception):
-    """Some rows of a batch weren't published (the rest were, and are marked); they stay for the next batch."""
+    """Some rows of a batch weren't published (the rest were, and are marked); each waits for its own retry."""
 
-    def __init__(self, failed: Sequence[tuple[int, BaseException]]) -> None:
+    def __init__(self, failed: Sequence[tuple[int, BaseException]], published: int) -> None:
         first_id, first = failed[0]
         super().__init__(f"{len(failed)} not published, first outbox row {first_id}: {type(first).__name__}: {first}")
         self.failed = list(failed)
+        self.published = published
+
+
+def describe(error: BaseException) -> str:
+    """An error as `last_error` holds it: no NUL (PostgreSQL text can't hold one), at most 1,000 characters (cut on a
+    character, never inside one)."""
+    return f"{type(error).__name__}: {error}".replace("\x00", "\\0")[:1000]
 
 
 @dataclass
@@ -102,7 +114,8 @@ class Relay:
         async with self.pool.connection() as conn, conn.transaction():
             rows = await (
                 await conn.execute(
-                    "SELECT id, body FROM outbox WHERE published_at IS NULL"
+                    "SELECT id, body FROM outbox"
+                    " WHERE published_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= now())"
                     " ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED",
                     (self.batch_size,),
                 )
@@ -132,8 +145,15 @@ class Relay:
             await asyncio.gather(*pending, return_exceptions=True)
             if published:
                 await conn.execute("UPDATE outbox SET published_at = now() WHERE id = ANY(%s)", (published,))
+            if failed:
+                async with conn.cursor() as cursor:
+                    await cursor.executemany(
+                        "UPDATE outbox SET attempts = attempts + 1, last_error = %s, next_attempt_at = now()"
+                        " + least(%s * power(2, least(attempts, 10)), %s) * interval '1 second' WHERE id = %s",
+                        [(describe(error), ROW_RETRY_FIRST, ROW_RETRY_MAX, row_id) for row_id, error in failed],
+                    )
         if failed:
-            raise RelayError(failed)
+            raise RelayError(failed, published=len(published))
         return len(published)
 
     async def _publish(self, channel: AbstractChannel, body: bytes) -> None:
@@ -150,9 +170,13 @@ class Relay:
             while not stop.is_set():
                 wake.clear()  # before the batch: a NOTIFY while it runs means another pass
                 try:
-                    published = await self.publish_batch()
+                    claimed = await self.publish_batch()
+                except RelayError as error:
+                    # Some rows failed and wait for their own retries; nothing is wrong with the relay, so no backoff
+                    # (it held every other message up for up to 5 s: day-2 review).
+                    log.warning("outbox relay: %s", error)
+                    claimed = error.published + len(error.failed)
                 except (
-                    RelayError,
                     psycopg.Error,
                     PoolTimeout,
                     aio_pika.exceptions.AMQPError,
@@ -172,7 +196,7 @@ class Relay:
                     backoff = min(backoff * 2, MAX_BACKOFF)
                     continue
                 backoff = MIN_BACKOFF
-                if published < self.batch_size:  # a full batch probably means more are waiting
+                if claimed < self.batch_size:  # a full batch probably means more are waiting
                     await _wait(stop, wake, timeout=self.poll_interval)
         finally:
             if listener is not None:
