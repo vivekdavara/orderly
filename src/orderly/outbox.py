@@ -9,9 +9,11 @@ afterwards:
 3. mark the confirmed ones published, in the claim's transaction, and commit.
 
 A crash between 2 and 3 publishes those rows again with the same message ids: at least once, which is why consumers
-deduplicate. A row whose publish failed (unroutable, no confirm) stays unpublished with its attempt count, its error
-and a time before which it isn't claimed again (0.5 s, doubling to a minute); the others in its batch are still
-marked, and the claims after it go on to the rows behind it.
+deduplicate. A row whose publish failed stays unpublished and the others in its batch are still marked. If the failure
+is the row's own (the broker returned it as unroutable, or it isn't a message), the row gets its attempt count, its
+error and a time before which it isn't claimed again (0.5 s after the failure, doubling to a minute), and the claims
+after it go on to the rows behind it. If it is the broker's (no confirm in time, a nack, a closed channel), the row is
+left as it was and the relay backs off, as for any outage.
 
 `Relay.run` repeats that until its stop event is set, checking the event only between batches, so a stop never
 interrupts a batch between publishing it and marking it. It sleeps between batches until a NOTIFY from `write` (on
@@ -33,7 +35,7 @@ from aio_pika.abc import AbstractChannel, AbstractConnection
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from orderly import broker
-from orderly.messages import Message, decode, encode
+from orderly.messages import InvalidMessage, Message, decode, encode
 from orderly.topology import Topology
 
 # The LISTEN/NOTIFY channel. Channels are per database, so the payload names the outbox's schema and a relay ignores
@@ -46,6 +48,10 @@ MAX_BACKOFF = 5.0
 # A failed row's own wait before its next attempt: 0.5 s after the first failure, doubling, at most a minute.
 ROW_RETRY_FIRST = 0.5
 ROW_RETRY_MAX = 60.0
+# The failures that belong to a row: the broker returned it (no binding takes its type), or it isn't a message. Every
+# other failure (no confirm in time, a nack, a closed channel or connection) is the broker's and shared by all the rows:
+# charging it to each one left them all waiting out their own delays after the broker recovered (review round 2).
+ROW_FAILURES: tuple[type[Exception], ...] = (aio_pika.exceptions.PublishError, InvalidMessage)
 
 log = logging.getLogger(__name__)
 
@@ -61,19 +67,23 @@ async def write(conn: psycopg.AsyncConnection[Any], message: Message) -> None:
 
 
 class RelayError(Exception):
-    """Some rows of a batch weren't published (the rest were, and are marked); each waits for its own retry."""
+    """Some rows of a batch weren't published (the rest were, and are marked). `broker` says whether any failure was
+    the broker's (the relay then backs off) rather than only the rows' own (each waits for its own retry)."""
 
     def __init__(self, failed: Sequence[tuple[int, BaseException]], published: int) -> None:
         first_id, first = failed[0]
         super().__init__(f"{len(failed)} not published, first outbox row {first_id}: {type(first).__name__}: {first}")
         self.failed = list(failed)
         self.published = published
+        self.broker = any(not isinstance(error, ROW_FAILURES) for _, error in failed)
 
 
 def describe(error: BaseException) -> str:
-    """An error as `last_error` holds it: no NUL (PostgreSQL text can't hold one), at most 1,000 characters (cut on a
+    """An error as `last_error` holds it: no NUL (PostgreSQL text can't hold one), no lone surrogate (psycopg can't
+    encode one, and the failed UPDATE would take the batch's marks with it), at most 1,000 characters (cut on a
     character, never inside one)."""
-    return f"{type(error).__name__}: {error}".replace("\x00", "\\0")[:1000]
+    text = f"{type(error).__name__}: {error}".replace("\x00", "\\0")
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")[:1000]
 
 
 @dataclass
@@ -148,12 +158,16 @@ class Relay:
             await asyncio.gather(*pending, return_exceptions=True)
             if published:
                 await conn.execute("UPDATE outbox SET published_at = now() WHERE id = ANY(%s)", (published,))
-            if failed:
+            own = [(row_id, error) for row_id, error in failed if isinstance(error, ROW_FAILURES)]
+            if own:
+                # clock_timestamp(), not now(): now() is the claim's start, and a failure that came late in a slow batch
+                # was due again before it was even recorded (review round 2).
                 async with conn.cursor() as cursor:
                     await cursor.executemany(
-                        "UPDATE outbox SET attempts = attempts + 1, last_error = %s, next_attempt_at = now()"
+                        "UPDATE outbox SET attempts = attempts + 1, last_error = %s,"
+                        " next_attempt_at = clock_timestamp()"
                         " + least(%s * power(2, least(attempts, 10)), %s) * interval '1 second' WHERE id = %s",
-                        [(describe(error), ROW_RETRY_FIRST, ROW_RETRY_MAX, row_id) for row_id, error in failed],
+                        [(describe(error), ROW_RETRY_FIRST, ROW_RETRY_MAX, row_id) for row_id, error in own],
                     )
         if failed:
             raise RelayError(failed, published=len(published))
@@ -175,8 +189,13 @@ class Relay:
                 try:
                     claimed = await self.publish_batch()
                 except RelayError as error:
-                    # Some rows failed and wait for their own retries; nothing is wrong with the relay, so no backoff
-                    # (it held every other message up for up to 5 s: day-2 review).
+                    if error.broker:  # the broker's failure: back off as for an outage (below)
+                        log.warning("outbox relay: %s; retrying in %.1f s", error, backoff)
+                        await _wait(stop, timeout=backoff)
+                        backoff = min(backoff * 2, MAX_BACKOFF)
+                        continue
+                    # Only rows that failed on their own, and wait for their own retries: nothing is wrong with the
+                    # relay, so no backoff (it held every other message up for up to 5 s: day-2 review).
                     log.warning("outbox relay: %s", error)
                     claimed = error.published + len(error.failed)
                 except (

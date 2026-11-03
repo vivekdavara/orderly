@@ -199,10 +199,13 @@ async def test_an_unroutable_row_stays_and_the_rest_of_its_batch_is_marked(
     attempts, last_error, wait = row
     assert attempts == 1 and last_error.startswith("PublishError: ") and "NO_ROUTE" in last_error
     assert timedelta(seconds=0.4) < wait <= timedelta(seconds=0.5)
-    # Once the binding is back, the first batch after the row's retry time publishes it; before it, none claims it.
+    # Once the binding is back, the first batch after the row's retry time publishes it; before it, none claims it
+    # (not even 0.2 s before: a claim a little early would pass a test that only looked at once).
     await commands_queue.bind(topology.commands, "payment.charge")
     assert await relay(pool, connection, topology).publish_batch() == 0
-    await asyncio.sleep(0.6)
+    await asyncio.sleep(0.3)
+    assert await relay(pool, connection, topology).publish_batch() == 0
+    await asyncio.sleep(0.3)
     assert await relay(pool, connection, topology).publish_batch() == 1
     assert await drain(channel, topology.queue("payment.commands"), 1) == [encode(stuck)]
 
@@ -621,3 +624,74 @@ async def test_a_confirm_that_never_comes_gives_up_after_publish_timeout(
     assert time.perf_counter() - started < 1.0
     assert await drain(channel, topology.queue("payment.commands"), 1) == [encode(fine)]
     assert await unpublished(pool) == 1
+
+
+async def test_a_missing_confirm_is_the_brokers_failure_not_the_rows(
+    pool: AsyncConnectionPool, connection: AbstractConnection, topology: Topology
+) -> None:
+    """No confirm in time (like a nack or a closed channel) says something about the broker, not this row: the row
+    isn't charged an attempt or a wait, and the error says the relay should back off (review round 2)."""
+
+    class NeverConfirms(Relay):
+        async def _publish(self, channel: AbstractChannel, body: bytes) -> None:
+            await asyncio.sleep(3600)
+
+    await write_all(pool, [charge()])
+    with pytest.raises(RelayError) as raised:
+        await NeverConfirms(pool=pool, connection=connection, topology=topology, publish_timeout=0.2).publish_batch()
+    assert raised.value.broker
+    async with pool.connection() as conn:
+        row = await (await conn.execute("SELECT attempts, last_error, next_attempt_at FROM outbox")).fetchone()
+    assert row == (0, None, None)
+
+
+async def test_an_unroutable_rows_error_is_its_own_and_backs_nothing_off(
+    pool: AsyncConnectionPool, connection: AbstractConnection, channel: AbstractChannel, topology: Topology
+) -> None:
+    commands_queue = await channel.get_queue(topology.queue("payment.commands"), ensure=False)
+    await commands_queue.unbind(topology.commands, "payment.charge")
+    await write_all(pool, [charge()])
+    with pytest.raises(RelayError) as raised:
+        await relay(pool, connection, topology).publish_batch()
+    assert not raised.value.broker
+
+
+async def test_after_a_full_batch_of_failing_rows_the_relay_goes_straight_to_the_rows_behind(
+    fresh_database: str,
+    pool: AsyncConnectionPool,
+    connection: AbstractConnection,
+    channel: AbstractChannel,
+    topology: Topology,
+) -> None:
+    commands_queue = await channel.get_queue(topology.queue("payment.commands"), ensure=False)
+    await commands_queue.unbind(topology.commands, "payment.charge")
+    r = relay(pool, connection, topology, listen_url=fresh_database, batch_size=5, poll_interval=30.0)
+    stop = asyncio.Event()
+    task = asyncio.create_task(r.run(stop))
+    try:
+        for _ in range(100):
+            if r.listener_pid is not None:
+                break
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.2)  # its first, empty batch is done: asleep until a NOTIFY
+        event = confirmed()
+        await write_all(pool, [*(charge(n) for n in range(5)), event])  # one NOTIFY: five failing rows, then one
+        started = time.perf_counter()
+        while True:
+            async with pool.connection() as conn:
+                row = await (
+                    await conn.execute("SELECT published_at FROM outbox WHERE message_id = %s", (event.message_id,))
+                ).fetchone()
+            if row is not None and row[0] is not None:
+                break
+            assert time.perf_counter() - started < 2.0, "the row behind a full batch of failures waited for the poll"
+            await asyncio.sleep(0.02)
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=5)
+    assert await drain(channel, topology.queue("notification.order-events"), 1) == [encode(event)]
+
+
+def test_last_error_holds_no_lone_surrogate() -> None:
+    # psycopg can't encode one, and the failed UPDATE would roll back the batch's marks (review round 2's suspicion).
+    assert outbox.describe(ValueError("bad \udc80 text")) == "ValueError: bad \\udc80 text"
