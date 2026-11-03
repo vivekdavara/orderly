@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 import psycopg
+import psycopg.conninfo
 import pytest
 from fastapi import FastAPI
 from helpers import count, running, stock, stock_of
@@ -291,3 +292,20 @@ async def test_a_request_that_cant_get_a_connection_in_time_is_a_503_not_a_500(f
         assert busy.status_code == 503 and busy.json()["detail"]["error"] == "database_busy"
         assert (await slow_read).status_code == 201
     assert count(fresh_database, "orders") == 2
+
+
+async def test_racing_orders_behave_the_same_under_a_repeatable_read_default(fresh_database: str) -> None:
+    """Why every pooled connection is pinned to READ COMMITTED: with the database defaulting to REPEATABLE READ, an
+    order that waited for another's row lock would fail with a serialization error (a 500) instead of re-checking
+    the stock and getting its 201 or 409."""
+    options = str(psycopg.conninfo.conninfo_to_dict(fresh_database)["options"])
+    url = psycopg.conninfo.make_conninfo(
+        fresh_database, options=f"{options} -c default_transaction_isolation=repeatable\\ read"
+    )
+    provider = FakeProvider(latency=0.01)
+    async with running(monolith.create_app(Settings("monolith", url, "amqp://unused/"), provider=provider)) as client:
+        stock(url, [("GADGET-2", 1000, 3)])
+        body = {"customer_id": "c-1", "email": "a@example.com", "lines": [{"sku": "GADGET-2", "quantity": 1}]}
+        responses = await asyncio.gather(*(client.post("/orders", json=body) for _ in range(12)))
+    assert sorted(response.status_code for response in responses) == [201] * 3 + [409] * 9
+    assert stock_of(url, "GADGET-2") == 0
