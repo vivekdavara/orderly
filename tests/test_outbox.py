@@ -695,3 +695,36 @@ async def test_after_a_full_batch_of_failing_rows_the_relay_goes_straight_to_the
 def test_last_error_holds_no_lone_surrogate() -> None:
     # psycopg can't encode one, and the failed UPDATE would roll back the batch's marks (review round 2's suspicion).
     assert outbox.describe(ValueError("bad \udc80 text")) == "ValueError: bad \\udc80 text"
+
+
+async def test_a_batch_waits_at_most_lock_timeout_for_a_table_lock(
+    fresh_database: str, pool: AsyncConnectionPool, connection: AbstractConnection, topology: Topology
+) -> None:
+    await write_all(pool, [charge()])
+    with psycopg.connect(fresh_database) as locker:
+        locker.execute("LOCK TABLE outbox IN ACCESS EXCLUSIVE MODE")  # what a migration's ALTER TABLE takes
+        started = time.perf_counter()
+        with pytest.raises(psycopg.errors.LockNotAvailable):  # not TimeoutError: the batch's own bound, not this one
+            await asyncio.wait_for(relay(pool, connection, topology, lock_timeout=0.2).publish_batch(), timeout=3)
+        assert time.perf_counter() - started < 2.0
+        locker.rollback()
+    assert await relay(pool, connection, topology).publish_batch() == 1
+
+
+async def test_a_channel_that_never_opens_times_out(
+    pool: AsyncConnectionPool, connection: AbstractConnection, topology: Topology, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def hangs(conn: AbstractConnection) -> AbstractChannel:
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(broker, "open_channel", hangs)
+    await write_all(pool, [charge()])
+    started = time.perf_counter()
+    task = asyncio.create_task(relay(pool, connection, topology, publish_timeout=0.2).publish_batch())
+    done, _ = await asyncio.wait([task], timeout=3)  # a regression fails here instead of hanging the suite
+    assert done, "opening the channel wasn't bounded"
+    with pytest.raises(TimeoutError):
+        await task
+    assert time.perf_counter() - started < 2.0
+    assert await unpublished(pool) == 1

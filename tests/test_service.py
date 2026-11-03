@@ -258,11 +258,14 @@ async def test_routes_are_added_to_the_skeleton(fresh_database: str, topology: T
 
 
 def test_shutdown_waits_longer_than_any_relay_batch_can_last() -> None:
-    """A relay batch waits at most pool_timeout for a connection and publish_timeout for its confirms; shutdown must
-    outwait both, with room for the claim and the mark, or a stop cancels a batch between publishing and marking it
-    (the day-2 review's test_stop_timeout_cancels_the_mark shows it at 10 s against 10 s)."""
+    """Every wait of a relay batch is bounded, and shutdown must outwait their sum, or a stop cancels a batch between
+    publishing and marking it (the day-2 review's test_stop_timeout_cancels_the_mark shows it at 10 s against 10 s)."""
     from orderly.outbox import Relay
 
-    publish_timeout = Relay.__dataclass_fields__["publish_timeout"].default
-    assert isinstance(publish_timeout, float)
-    assert 2 * (Settings("orders", "", "").pool_timeout + publish_timeout) <= service.STOP_TIMEOUT
+    fields = Relay.__dataclass_fields__
+    publish_timeout, lock_timeout = fields["publish_timeout"].default, fields["lock_timeout"].default
+    assert isinstance(publish_timeout, float) and isinstance(lock_timeout, float)
+    # Every wait a batch can make, each bounded: a pooled connection, the channel's open, the claim's and the mark's
+    # table locks, the confirms.
+    longest_batch = Settings("orders", "", "").pool_timeout + publish_timeout + 2 * lock_timeout + publish_timeout
+    assert longest_batch + 5 <= service.STOP_TIMEOUT

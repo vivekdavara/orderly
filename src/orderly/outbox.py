@@ -97,9 +97,13 @@ class Relay:
     listen_url: str | None = None
     batch_size: int = 100
     poll_interval: float = 1.0
-    # How long a batch waits for its confirms before giving up on the missing ones (they are published again later).
-    # Well inside service.STOP_TIMEOUT, so a shutdown waits for the batch instead of cancelling it.
+    # How long a batch waits for its confirms before giving up on the missing ones (they are published again later),
+    # and for a channel to open. Well inside service.STOP_TIMEOUT, so a shutdown waits for the batch instead of
+    # cancelling it.
     publish_timeout: float = 5.0
+    # How long the batch's statements wait for a table lock (a migration's ALTER TABLE outbox) before the batch fails
+    # and the relay backs off; row locks never make it wait (SKIP LOCKED). Also inside STOP_TIMEOUT's margin.
+    lock_timeout: float = 5.0
     _channel: AbstractChannel | None = field(default=None, init=False, repr=False)
     # The listener's server process id while it is connected (tests end it to simulate a lost connection).
     listener_pid: int | None = field(default=None, init=False)
@@ -110,7 +114,9 @@ class Relay:
         # A channel the broker closed (an error on it) or lost with the connection is replaced, not reused.
         if self._channel is None or self._channel.is_closed:
             try:
-                self._channel = await broker.open_channel(self.connection)
+                # Bounded, so a batch's length is too (service.STOP_TIMEOUT counts on it): a TimeoutError backs off.
+                async with asyncio.timeout(self.publish_timeout):
+                    self._channel = await broker.open_channel(self.connection)
             except RuntimeError as error:
                 # aio-pika ("Connection was not opened") and aiormq ("<Connection ...> closed") raise a bare
                 # RuntimeError for a channel opened while a robust connection is reconnecting; the relay died of it
@@ -125,6 +131,7 @@ class Relay:
         """
         channel = await self._open_channel()
         async with self.pool.connection() as conn, conn.transaction():
+            await conn.execute("SELECT set_config('lock_timeout', %s, true)", (f"{round(self.lock_timeout * 1000)}ms",))
             rows = await (
                 await conn.execute(
                     "SELECT id, body FROM outbox"
