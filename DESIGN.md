@@ -93,7 +93,9 @@ The part of the monolith the order service keeps (`orderly.ordering`), shared by
   negative. The unit price is the locked row's. All lines must share one currency, and the total stay within 10^12
   cents (both `422`).
 - Every pooled connection is **pinned to READ COMMITTED**: the reservation relies on re-evaluating `stock >= q` after a
-  wait, which REPEATABLE READ would turn into a serialization failure.
+  wait, which REPEATABLE READ would turn into a serialization failure (a test races orders under a REPEATABLE READ
+  default; without the pin they fail with `SerializationFailure`). And to **DateStyle ISO**, the only style psycopg
+  parses timestamptz in: under `'SQL, DMY'` every order failed after the monolith had charged (day-2 review).
 
 The order service's write after the reservation: the order as `AWAITING_PAYMENT` with `payment_deadline = now() +
 timeout` (30 s by default), its lines, and `payment.charge` (the order's total, the order id as correlation) to the
@@ -304,16 +306,25 @@ As built (`orderly.outbox`, day 2):
 
 - A batch is **published all at once, then confirmed**: every message of the batch goes out before any confirm is
   awaited, so a batch costs about one round trip, not one per message. Rows whose publish failed (returned as
-  unroutable, or no confirm within `publish_timeout`, 10 s) stay unpublished and are reported as one `RelayError`; the
-  rest of the batch is still marked. A test unbinds a queue: its row stays, the other row of the batch is marked, and
-  the next batch after the binding returns publishes it.
+  unroutable, or no confirm within `publish_timeout`, 5 s) stay unpublished and are reported as one `RelayError`; the
+  rest of the batch is still marked.
+- **A failed row waits for its own retry** (migration 0002): in the claim's transaction it gets `attempts + 1`, its
+  `last_error` (no NUL, at most 1,000 characters) and a `next_attempt_at` 0.5 s later, doubling to a minute, and the
+  claim skips rows whose time hasn't come. Without it (the day-2 review), `batch_size` rows that kept failing were
+  claimed again by every batch and nothing behind them was ever published; and the relay treated a partial failure as
+  an outage and backed off to 5 s, ignoring NOTIFY. A `RelayError` now backs nothing off: its rows already wait.
 - **The loop**: `wake` is cleared before each batch (a NOTIFY while a batch runs means another pass); a full batch goes
   straight to the next; otherwise it waits for a NOTIFY, the poll interval (1 s) or the stop. Database and broker
   errors back off from 0.1 s, doubling to 5 s. The listener has its own connection, sets `wake` once right after
   `LISTEN` (a row committed before it took effect notified no one), and reconnects after a lost connection while
-  polling covers the gap. Anything else (a bug) ends the relay, and `/health` says so.
-- **A stop** comes through the service skeleton: shutdown sets the workers' stop event and waits for them (up to 10 s)
-  before cancelling. A test stops the relay mid-batch; the batch is still marked.
+  polling covers the gap. A NOTIFY's payload is the writer's schema and the listener wakes only for its own: channels
+  are per database, and the tests share one database with a schema each. Anything else (a bug) ends the relay, and
+  `/health` says so.
+- **A stop** comes through the service skeleton: shutdown sets the workers' stop event and waits for them, up to 30 s,
+  before cancelling. A batch lasts at most the pool's 5 s wait for a connection plus the 5 s confirm wait (and its
+  claim and mark), so the cancel never lands between publishing and marking; at 10 s against a 10 s confirm wait it
+  did, re-sending a confirmed message after the restart (day-2 review). A test stops the relay mid-batch; the batch is
+  still marked.
 - **Two ways the relay died, found by running it inside the order service and fixed**: aiormq raises `CancelledError`
   into whoever awaits an RPC when the connection closes under it (the relay was opening its channel), though nothing
   cancelled the relay's task; and while a robust connection reconnects, opening a channel raises a bare `RuntimeError`.
