@@ -59,7 +59,7 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `scripts/postgres.sh` | Creates, migrates, lists and drops Orderly's databases on the local PostgreSQL 14 (`ORDERLY_PG_PREFIX` renames them) |
 | `scripts/measure_test_fixture.py` | Times CREATE DATABASE against CREATE SCHEMA (why each test gets a schema) |
 | `scripts/measure_relay.py`, `scripts/measure_intake.py` | The relay's throughput by batch size; order intake, monolith against order service, on one hot product |
-| `tests/` | 366 tests: unit, property and integration tests against the real servers |
+| `tests/` | 368 tests: unit, property and integration tests against the real servers |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
 ## Run it
@@ -111,7 +111,7 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 366 tests in about 75 s here (`/usr/bin/time -p make check`: 74.6 s real at 16:18, load average 2.4; 30.7 s for day 1's 231). Day 2's:
+`make check` runs 368 tests in about 75 s here (`/usr/bin/time -p make check` at `2c715ec`, 366 tests: 74.6 s real at 16:18, load average 2.4; 30.7 s for day 1's 231). Day 2's:
 
 - **The monolith** (23, `tests/test_monolith.py`): confirmed (stock, payment, notification, e-mail), declined (402, stock back),
   refused orders writing and charging nothing (out of stock, unknown sku, mixed currencies, a total over the limit),
@@ -132,10 +132,10 @@ Erlang distribution (25673) and epmd to loopback.
   another schema's writes not waking it; a failing row's own wait (0.5 s from the failure, doubling to a minute) and
   error text; a missing confirm counted as the broker's, not the row's; a backlog draining without the poll; the
   backoff reset; `SKIP LOCKED` letting a second relay take the next rows; a NOTIFY during a batch kept.
-- **The order service** (11, `tests/test_orders_service.py`): the order and its command end to end to the
+- **The order service** (13, `tests/test_orders_service.py`): the order and its command end to end to the
   `payment.commands` queue; the deadline; no command for a refused order or a replay; 50 concurrent orders, 50
   commands; an outbox failure rolling the order back; orders taken while the broker is closed; a real connection drop,
-  then the outbox drained after the reconnect.
+  then the outbox drained after the reconnect; `/health` reporting a backlog and a failing row without failing.
 - **The skeleton** (day 2's additions): the monolith never connecting to a broker, READ COMMITTED under a REPEATABLE
   READ default, workers awaited at shutdown (cancelled only after the timeout, which outwaits any default batch), a
   dead worker making `/health` 503. And DateStyle pinned to ISO (a review test).
@@ -325,8 +325,8 @@ connection and with the lock already held, `-1` really meaning no limit, cleanup
 - An outbox row that can never be published (a type no binding routes) is retried forever, its wait doubling from
   0.5 s to a minute, with `attempts` and `last_error` in its row; there is no parking place for it and no alert. It
   doesn't hold up the rows behind it (the day-2 review found that it did).
-- `/health` says nothing about the outbox: a relay that is alive but whose rows keep failing reports healthy. The
-  outbox's depth and oldest row are worth exposing (day 4's measurements will want them too).
+- `/health` reports the outbox (unpublished rows, rows failing on their own, the oldest row's age) but never fails on
+  it: a stuck row is for an alert to catch, and there is no alerting here.
 - A batch's claim transaction stays open while it waits for confirms (5 s at most), so a server with
   `idle_in_transaction_session_timeout` under that would end it and the batch would be published again.
 - Shutdown waits 30 s for a batch to finish, which covers the default pool wait and confirm wait (5 s each) but is not

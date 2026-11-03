@@ -129,7 +129,9 @@ the services, RabbitMQ on 5673 (one node), PostgreSQL 14 on 5432 with one databa
 Every service starts the same way (`orderly.service`, day 1): it migrates its own database, declares the whole
 topology, and opens its connection pool; if any of that fails it doesn't start, so a service never runs against a
 schema or a broker it doesn't expect. `/health` answers 200 only while its database answers (within 2 s) at the
-migration this code expects and its broker connection is up, and 503 naming each problem otherwise. "Expects" means
+migration this code expects and its broker connection is up (and, from day 2, its workers are running), and 503 naming
+each problem otherwise; a service with an outbox also reports its unpublished rows, those failing on their own, and the
+oldest row's age, as information that never makes it 503 (a backlog during a broker outage is expected). "Expects" means
 exactly: a schema ahead of the code is unhealthy too. Running old and new versions side by side during a rolling
 deploy would need expand/contract migrations and a looser rule; this project deploys one version at a time.
 
