@@ -313,3 +313,46 @@ async def test_run_backs_off_and_keeps_going_after_a_failed_batch(
         stop.set()
         await asyncio.wait_for(task, timeout=10)
     await drain(channel, topology.queue("payment.commands"), 1)
+
+
+async def test_a_cancelled_error_raised_by_the_broker_library_doesnt_end_the_relay(
+    pool: AsyncConnectionPool,
+    connection: AbstractConnection,
+    channel: AbstractChannel,
+    topology: Topology,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """aiormq raises CancelledError into an RPC's caller when the connection closes under it, though the caller's
+    task wasn't cancelled. The relay treats that as a broker error and retries (it used to die of it)."""
+    real_open = broker.open_channel
+    calls = []
+
+    async def open_once_cancelled(conn: AbstractConnection) -> AbstractChannel:
+        calls.append(1)
+        if len(calls) == 1:
+            raise asyncio.CancelledError
+        return await real_open(conn)
+
+    monkeypatch.setattr(broker, "open_channel", open_once_cancelled)
+    await write_all(pool, [charge()])
+    stop = asyncio.Event()
+    task = asyncio.create_task(relay(pool, connection, topology, poll_interval=0.1).run(stop))
+    try:
+        assert await wait_until_published(pool, timeout=5.0) < 5.0
+        assert not task.done()
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=5)
+    assert len(calls) == 2
+    await drain(channel, topology.queue("payment.commands"), 1)
+
+
+async def test_a_real_cancel_still_ends_the_relay(
+    pool: AsyncConnectionPool, connection: AbstractConnection, topology: Topology
+) -> None:
+    task = asyncio.create_task(relay(pool, connection, topology, poll_interval=30.0).run(asyncio.Event()))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    assert task.cancelled()

@@ -78,9 +78,17 @@ class Relay:
     _channel: AbstractChannel | None = field(default=None, init=False, repr=False)
 
     async def _open_channel(self) -> AbstractChannel:
+        if self.connection.is_closed:
+            raise ConnectionError("the broker connection is closed")
         # A channel the broker closed (an error on it) or lost with the connection is replaced, not reused.
         if self._channel is None or self._channel.is_closed:
-            self._channel = await broker.open_channel(self.connection)
+            try:
+                self._channel = await broker.open_channel(self.connection)
+            except RuntimeError as error:
+                # aio-pika ("Connection was not opened") and aiormq ("<Connection ...> closed") raise a bare
+                # RuntimeError for a channel opened while a robust connection is reconnecting; the relay died of it
+                # after a broker drop. It is a broker outage like any other.
+                raise ConnectionError(f"could not open a channel: {error}") from error
         return self._channel
 
     async def publish_batch(self) -> int:
@@ -113,6 +121,8 @@ class Relay:
             for (row_id, _), task in zip(rows, tasks, strict=True):
                 if task in pending:
                     failed.append((row_id, TimeoutError(f"no confirm within {self.publish_timeout} s")))
+                elif task.cancelled():  # aiormq cancels a publish whose connection closed under it
+                    failed.append((row_id, ConnectionError("publish cancelled: the broker connection closed")))
                 elif (error := task.exception()) is not None:
                     failed.append((row_id, error))
                 else:
@@ -147,8 +157,15 @@ class Relay:
                     ConnectionError,
                     OSError,
                     TimeoutError,
+                    asyncio.CancelledError,
                 ) as error:
-                    log.warning("outbox relay: %s; retrying in %.1f s", error, backoff)
+                    # aiormq raises CancelledError into whoever awaits an RPC when the connection closes under it
+                    # (opening a channel, a confirm), though nobody cancelled this task: found when a service's
+                    # broker closed while its relay opened a channel, and the relay died. Only a real cancel ends it.
+                    current = asyncio.current_task()
+                    if isinstance(error, asyncio.CancelledError) and current is not None and current.cancelling():
+                        raise
+                    log.warning("outbox relay: %r; retrying in %.1f s", error, backoff)
                     await _wait(stop, timeout=backoff)
                     backoff = min(backoff * 2, MAX_BACKOFF)
                     continue
