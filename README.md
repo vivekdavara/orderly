@@ -59,7 +59,7 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `scripts/postgres.sh` | Creates, migrates, lists and drops Orderly's databases on the local PostgreSQL 14 (`ORDERLY_PG_PREFIX` renames them) |
 | `scripts/measure_test_fixture.py` | Times CREATE DATABASE against CREATE SCHEMA (why each test gets a schema) |
 | `scripts/measure_relay.py`, `scripts/measure_intake.py` | The relay's throughput by batch size; order intake, monolith against order service, on one hot product |
-| `tests/` | 368 tests: unit, property and integration tests against the real servers |
+| `tests/` | 370 tests: unit, property and integration tests against the real servers |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
 ## Run it
@@ -111,7 +111,7 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 368 tests in about 75 s here (`/usr/bin/time -p make check` at `2c715ec`, 366 tests: 74.6 s real at 16:18, load average 2.4; 30.7 s for day 1's 231). Day 2's:
+`make check` runs 370 tests in about 75 s here (`/usr/bin/time -p make check` at `2c715ec`, 366 tests: 74.6 s real at 16:18, load average 2.4; 30.7 s for day 1's 231). Day 2's:
 
 - **The monolith** (23, `tests/test_monolith.py`): confirmed (stock, payment, notification, e-mail), declined (402, stock back),
   refused orders writing and charging nothing (out of stock, unknown sku, mixed currencies, a total over the limit),
@@ -123,7 +123,7 @@ Erlang distribution (25673) and epmd to loopback.
   again, and two orders for one product take two provider latencies.
 - **Taking an order** (34, `tests/test_ordering.py`): what the request accepts and refuses, the fingerprint, the key's
   characters.
-- **The outbox** (29, `tests/test_outbox.py`, real servers): the NOTIFY on commit only; id order; batch sizes; routing;
+- **The outbox** (31, `tests/test_outbox.py`, real servers): the NOTIFY on commit only; id order; batch sizes; routing;
   two relays publishing 600 rows exactly once (fails without `SKIP LOCKED`); a crash before the mark re-publishing
   the same bytes; an unroutable row left while the rest of its batch is marked (fails if failed rows are marked); a
   closed channel replaced; the NOTIFY waking a relay whose poll is 30 s; polling without a listener; a stop mid-batch
@@ -131,7 +131,8 @@ Erlang distribution (25673) and epmd to loopback.
   real cancel ending it; a lost listener reconnecting, with a row written meanwhile going out at the reconnect;
   another schema's writes not waking it; a failing row's own wait (0.5 s from the failure, doubling to a minute) and
   error text; a missing confirm counted as the broker's, not the row's; a backlog draining without the poll; the
-  backoff reset; `SKIP LOCKED` letting a second relay take the next rows; a NOTIFY during a batch kept.
+  backoff reset; `SKIP LOCKED` letting a second relay take the next rows; a NOTIFY during a batch kept; a claim behind
+  a table lock and a channel that never opens, each giving up within its bound.
 - **The order service** (13, `tests/test_orders_service.py`): the order and its command end to end to the
   `payment.commands` queue; the deadline; no command for a refused order or a replay; 50 concurrent orders, 50
   commands; an outbox failure rolling the order back; orders taken while the broker is closed; a real connection drop,
@@ -257,7 +258,8 @@ counted from the claim's `now()`, so a failure late in a slow batch was due befo
 now). Its outage test is kept with its setup adapted (it waited for five charged attempts, which the fix no longer
 makes), and its timing test recast onto a row failure late in a slow batch, since a missing confirm is no longer the
 row's; both fail on the code before the fix. Its two surviving mutants and its lone-surrogate suspicion have tests. Its
-inferences that STOP_TIMEOUT isn't a hard bound are under Limitations.
+inference that STOP_TIMEOUT wasn't a real bound (a channel open with no timeout, a claim waiting on a table lock) led to
+bounding both (`cdd03d8`).
 
 ## Review of day 1
 
@@ -329,10 +331,10 @@ connection and with the lock already held, `-1` really meaning no limit, cleanup
   it: a stuck row is for an alert to catch, and there is no alerting here.
 - A batch's claim transaction stays open while it waits for confirms (5 s at most), so a server with
   `idle_in_transaction_session_timeout` under that would end it and the batch would be published again.
-- Shutdown waits 30 s for a batch to finish, which covers the default pool wait and confirm wait (5 s each) but is not
-  a hard bound: a pool timeout set above about 10 s, a claim blocked on a table lock (a migration's `ALTER`), or a
-  channel open that hangs could push a batch past it, and the cancel could then land between publish and mark. That
-  re-sends a batch (at least once still holds); it doesn't lose one.
+- Shutdown waits 30 s for a batch, which outwaits every bounded wait of one with the defaults (a pooled connection 5 s,
+  the channel's open 5 s, two table-lock waits 5 s each, the confirms 5 s). `ORDERLY_POOL_TIMEOUT_S` above 10 s would
+  break that margin, and the cancel could then land between publish and mark: that re-sends a batch (at least once
+  still holds), it never loses one.
 - `last_error` is capped at 1,000 characters by a CHECK on `length()`, which counts characters in a UTF-8 database (all
   of Orderly's) but bytes in a SQL_ASCII one.
 - `emails.money` writes two decimals for every currency (500 JPY would read "5.00 JPY"); every product is USD here.

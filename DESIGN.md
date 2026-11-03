@@ -329,10 +329,10 @@ As built (`orderly.outbox`, day 2):
   are per database, and the tests share one database with a schema each. Anything else (a bug) ends the relay, and
   `/health` says so.
 - **A stop** comes through the service skeleton: shutdown sets the workers' stop event and waits for them, up to 30 s,
-  before cancelling. A batch lasts at most the pool's 5 s wait for a connection plus the 5 s confirm wait (and its
-  claim and mark), so the cancel never lands between publishing and marking; at 10 s against a 10 s confirm wait it
-  did, re-sending a confirmed message after the restart (day-2 review). A test stops the relay mid-batch; the batch is
-  still marked.
+  before cancelling. Every wait of a batch is bounded: a pooled connection (5 s), the channel's open (5 s), the claim's
+  and the mark's table locks (`lock_timeout`, 5 s each, for a migration's `ALTER TABLE`), the confirms (5 s): 25 s in
+  all, so the cancel never lands between publishing and marking. At 10 s against a 10 s confirm wait it did, re-sending
+  a confirmed message after the restart (day-2 review). A test stops the relay mid-batch; the batch is still marked.
 - **Two ways the relay died, found by running it inside the order service and fixed**: aiormq raises `CancelledError`
   into whoever awaits an RPC when the connection closes under it (the relay was opening its channel), though nothing
   cancelled the relay's task; and while a robust connection reconnects, opening a channel raises a bare `RuntimeError`.
