@@ -305,7 +305,8 @@ were.
 **What else did it suspect?**
 That the NOTIFY test was flaky: channels are per database and the tests share one, so another run's writes counted.
 The payload names the schema now. Its other suspicions are limitations in the README: `/health` doesn't see a stuck
-outbox, a short `idle_in_transaction_session_timeout` would cut a batch, and two decimals for every currency.
+outbox (it reports it now), a short `idle_in_transaction_session_timeout` would cut a batch, and two decimals for every
+currency (the e-mails use each currency's minor unit now).
 
 ## What went wrong on day 1
 

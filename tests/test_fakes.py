@@ -145,3 +145,17 @@ def test_the_two_emails() -> None:
     assert cancelled.body.endswith("could not confirm your payment in time. Any charge for it will be refunded.")
     declined = emails.cancellation(order, "a@example.com", "payment_declined")
     assert declined.body.endswith("your payment was declined. You have not been charged.")
+
+
+@pytest.mark.parametrize(
+    ("amount", "currency", "text"),
+    [
+        (500, "JPY", "500 JPY"),
+        (0, "KRW", "0 KRW"),
+        (1250, "KWD", "1.250 KWD"),
+        (5, "BHD", "0.005 BHD"),
+        (5, "EUR", "0.05 EUR"),
+    ],
+)
+def test_money_uses_the_currencys_minor_unit(amount: int, currency: str, text: str) -> None:
+    assert emails.money(amount, currency) == text

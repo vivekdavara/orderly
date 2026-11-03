@@ -59,7 +59,7 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `scripts/postgres.sh` | Creates, migrates, lists and drops Orderly's databases on the local PostgreSQL 14 (`ORDERLY_PG_PREFIX` renames them) |
 | `scripts/measure_test_fixture.py` | Times CREATE DATABASE against CREATE SCHEMA (why each test gets a schema) |
 | `scripts/measure_relay.py`, `scripts/measure_intake.py` | The relay's throughput by batch size; order intake, monolith against order service, on one hot product |
-| `tests/` | 370 tests: unit, property and integration tests against the real servers |
+| `tests/` | 375 tests: unit, property and integration tests against the real servers |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
 ## Run it
@@ -111,7 +111,7 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 370 tests in about 75 s here (`/usr/bin/time -p make check` at `2c715ec`, 366 tests: 74.6 s real at 16:18, load average 2.4; 30.7 s for day 1's 231). Day 2's:
+`make check` runs 375 tests in about 75 s here (`/usr/bin/time -p make check` at `2c715ec`, 366 tests: 74.6 s real at 16:18, load average 2.4; 30.7 s for day 1's 231). Day 2's:
 
 - **The monolith** (23, `tests/test_monolith.py`): confirmed (stock, payment, notification, e-mail), declined (402, stock back),
   refused orders writing and charging nothing (out of stock, unknown sku, mixed currencies, a total over the limit),
@@ -140,8 +140,8 @@ Erlang distribution (25673) and epmd to loopback.
 - **The skeleton** (day 2's additions): the monolith never connecting to a broker, READ COMMITTED under a REPEATABLE
   READ default, workers awaited at shutdown (cancelled only after the timeout, which outwaits any default batch), a
   dead worker making `/health` 503. And DateStyle pinned to ISO (a review test).
-- **Fakes and seed** (23): deterministic declines and per-attempt errors, idempotent charges, the e-mails' wording
-  and integer money, the catalogue.
+- **Fakes and seed** (28): deterministic declines and per-attempt errors, idempotent charges, the e-mails' wording
+  and integer money in each currency's minor unit, the catalogue.
 - **The review's tests** (6, `tests/review_d2/` and `tests/review_d2r2/`): each failed on the code it was written
   against and passes now.
 
@@ -337,7 +337,6 @@ connection and with the lock already held, `-1` really meaning no limit, cleanup
   still holds), it never loses one.
 - `last_error` is capped at 1,000 characters by a CHECK on `length()`, which counts characters in a UTF-8 database (all
   of Orderly's) but bytes in a SQL_ASCII one.
-- `emails.money` writes two decimals for every currency (500 JPY would read "5.00 JPY"); every product is USD here.
 - The relay doesn't promise a global order across orders (ids are taken before commit); nothing relies on one.
 - The fakes keep their state in memory: restarting the monolith forgets its provider's charges.
 - The RabbitMQ script tests run only where RabbitMQ is installed; CI uses a service container and skips them.
