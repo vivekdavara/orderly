@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
 import psycopg
+import psycopg.conninfo
 import pytest
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from orderly import service
@@ -31,7 +33,7 @@ def settings(fresh_database: str, topology: Topology, service: str = "orders") -
     return Settings(service=service, database_url=fresh_database, amqp_url=amqp_url(), topology=topology)
 
 
-@pytest.mark.parametrize("service", ["orders", "payments", "notifications"])
+@pytest.mark.parametrize("service", ["orders", "payments", "notifications", "monolith"])
 async def test_a_started_service_has_migrated_and_is_healthy(
     fresh_database: str, topology: Topology, service: str
 ) -> None:
@@ -75,6 +77,7 @@ async def test_a_lost_broker_is_unhealthy(fresh_database: str, topology: Topolog
     app = create_app(settings(fresh_database, topology))
     async with running(app) as client:
         resources: Resources = app.state.resources
+        assert resources.broker is not None
         await resources.broker.close()
         response = await client.get("/health")
     assert response.status_code == 503
@@ -100,7 +103,9 @@ async def test_an_unreachable_broker_stops_the_start(fresh_database: str, topolo
 def test_unknown_services_and_the_port_map() -> None:
     with pytest.raises(ValueError, match="unknown service 'inventory'"):
         create_app(Settings("inventory", "postgresql://x/y", "amqp://x/"))
-    assert PORTS == {"orders": 8112, "payments": 8113, "notifications": 8114}
+    # The monolith takes the order service's port: it is the alternative to the split, and clients point at :8112
+    # either way.
+    assert PORTS == {"orders": 8112, "payments": 8113, "notifications": 8114, "monolith": 8112}
 
 
 async def test_a_pool_that_cant_fill_is_closed_not_left_retrying(
@@ -132,7 +137,7 @@ async def test_shutdown_closes_the_broker_connection_and_the_pool(fresh_database
     app = create_app(settings(fresh_database, topology))
     async with running(app):
         resources: Resources = app.state.resources
-    assert resources.broker.is_closed
+    assert resources.broker is not None and resources.broker.is_closed
     assert resources.pool.closed
 
 
@@ -140,6 +145,7 @@ async def test_a_broker_reconnecting_is_unhealthy(fresh_database: str, topology:
     app = create_app(settings(fresh_database, topology))
     async with running(app) as client:
         resources: Resources = app.state.resources
+        assert resources.broker is not None
         resources.broker.connected.clear()  # what aio-pika's robust connection does while it reconnects
         try:
             response = await client.get("/health")
@@ -172,3 +178,92 @@ async def test_a_schema_ahead_of_the_code_is_unhealthy_too(fresh_database: str, 
         response = await client.get("/health")
     assert response.status_code == 503
     assert response.json()["problems"] == {"schema": "database at migration 2, this code expects 1"}
+
+
+# Day 2: the brokerless monolith, the pinned isolation level, and background workers.
+
+
+async def test_the_monolith_never_connects_to_a_broker(fresh_database: str) -> None:
+    unreachable = Settings("monolith", fresh_database, "amqp://guest:guest@127.0.0.1:1/")
+    app = create_app(unreachable)
+    async with running(app) as client:
+        response = await client.get("/health")
+        assert app.state.resources.broker is None
+    assert response.status_code == 200, response.text
+    assert response.json()["problems"] == {}
+
+
+async def test_every_pooled_transaction_is_read_committed(fresh_database: str, topology: Topology) -> None:
+    # A database (here, the connection's) defaulting to REPEATABLE READ doesn't change the services' isolation.
+    options = str(psycopg.conninfo.conninfo_to_dict(fresh_database)["options"])
+    url = psycopg.conninfo.make_conninfo(
+        fresh_database, options=f"{options} -c default_transaction_isolation=repeatable\\ read"
+    )
+    with psycopg.connect(url) as conn:
+        assert conn.execute("SHOW transaction_isolation").fetchone() == ("repeatable read",)
+    app = create_app(settings(url, topology))
+    async with running(app):
+        resources: Resources = app.state.resources
+        async with resources.pool.connection() as conn:
+            assert await (await conn.execute("SHOW transaction_isolation")).fetchone() == ("read committed",)
+
+
+async def test_workers_run_until_asked_to_stop_and_are_awaited_not_cancelled(
+    fresh_database: str, topology: Topology
+) -> None:
+    events: list[str] = []
+
+    async def worker(resources: Resources, stop: asyncio.Event) -> None:
+        events.append(f"started with {resources.settings.service}")
+        await stop.wait()
+        await asyncio.sleep(0.05)  # finishing what it started: a cancel here would lose the next line
+        events.append("finished")
+
+    app = create_app(settings(fresh_database, topology), workers=[worker])
+    async with running(app) as client:
+        assert (await client.get("/health")).status_code == 200
+        [task] = app.state.resources.workers
+        assert task.get_name() == "orders.worker"
+    assert events == ["started with orders", "finished"]
+
+
+async def test_a_worker_that_ignores_stop_is_cancelled_after_the_timeout(
+    fresh_database: str, topology: Topology, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(service, "STOP_TIMEOUT", 0.1)
+    cancelled: list[bool] = []
+
+    async def stubborn(resources: Resources, stop: asyncio.Event) -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    app = create_app(settings(fresh_database, topology), workers=[stubborn])
+    async with running(app):
+        pass
+    assert cancelled == [True]
+
+
+async def test_a_dead_worker_makes_the_service_unhealthy(fresh_database: str, topology: Topology) -> None:
+    async def broken(resources: Resources, stop: asyncio.Event) -> None:
+        raise RuntimeError("relay bug")
+
+    app = create_app(settings(fresh_database, topology), workers=[broken])
+    async with running(app) as client:
+        await asyncio.sleep(0)  # let it run and die
+        response = await client.get("/health")
+    assert response.status_code == 503
+    assert response.json()["problems"] == {"worker orders.broken": "died: RuntimeError('relay bug')"}
+
+
+async def test_routes_are_added_to_the_skeleton(fresh_database: str, topology: Topology) -> None:
+    router = APIRouter()
+
+    @router.get("/ping")
+    async def ping() -> dict[str, str]:
+        return {"pong": "yes"}
+
+    async with running(create_app(settings(fresh_database, topology), router=router)) as client:
+        assert (await client.get("/ping")).json() == {"pong": "yes"}

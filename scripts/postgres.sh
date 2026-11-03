@@ -3,8 +3,8 @@
 #
 #   scripts/postgres.sh create | migrate | status | drop
 #
-# create: makes the service databases (orderly_orders, orderly_payments, orderly_notifications) and the test database
-#   (orderly_test) if missing, then migrates the service databases.
+# create: makes the service databases (orderly_orders, orderly_payments, orderly_notifications), the monolith's
+#   (orderly_monolith) and the test database (orderly_test) if missing, then migrates all but the test database.
 # migrate: applies pending migrations to each service database (python -m orderly.migrate).
 # status: lists the databases and each one's latest applied migration.
 # drop: drops exactly those databases, after asking (ORDERLY_PG_YES=1 to skip the question).
@@ -19,7 +19,7 @@ export PGHOST="${PGHOST:-localhost}"
 export PGPORT="${PGPORT:-5432}"
 PSQL="${PSQL:-psql}"
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
-SERVICES=(orders payments notifications)
+SERVICES=(orders payments notifications monolith)
 PREFIX="${ORDERLY_PG_PREFIX:-orderly}"
 TEST_DB="${PREFIX}_test"
 

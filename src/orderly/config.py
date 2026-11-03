@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import os
 
-# The service databases with migrations so far (DESIGN.md "Data"); the monolith's arrives on day 2.
-SERVICES = ("orders", "payments", "notifications")
+# The databases with migrations: the three services, and the monolith they were split from (DESIGN.md "The
+# monolith"), which is kept as the baseline.
+SERVICES = ("orders", "payments", "notifications", "monolith")
+# The monolith publishes and consumes nothing: it doesn't connect to RabbitMQ at all.
+WITHOUT_BROKER = frozenset({"monolith"})
 
 
 def database_url(service: str) -> str:

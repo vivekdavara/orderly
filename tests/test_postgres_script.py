@@ -72,7 +72,7 @@ def script(test_database: str) -> Iterator[Script]:
 def test_create_makes_and_migrates_the_databases_once(script: Script) -> None:
     first = script.run("create")
     assert first.returncode == 0, first.stderr
-    names = {f"{script.prefix}_{suffix}" for suffix in ("orders", "payments", "notifications", "test")}
+    names = {f"{script.prefix}_{suffix}" for suffix in ("orders", "payments", "notifications", "monolith", "test")}
     assert databases(script.url, script.prefix) == names
     assert f"{script.prefix}_orders created" in first.stdout
     assert "orders: applied [1], now at 1" in first.stdout
@@ -91,6 +91,7 @@ def test_status_reports_each_database(script: Script) -> None:
         f"{script.prefix}_orders: migration 1",
         f"{script.prefix}_payments: migration 1",
         f"{script.prefix}_notifications: migration 1",
+        f"{script.prefix}_monolith: migration 1",
         f"{script.prefix}_test: present (tests make a schema each)",
     ]
 
@@ -102,11 +103,11 @@ def test_drop_asks_and_drops_only_its_own(script: Script) -> None:
     try:
         refused = script.run("drop", stdin="n\n")
         assert "nothing dropped" in refused.stdout
-        assert len(databases(script.url, script.prefix)) == 4
+        assert len(databases(script.url, script.prefix)) == 5
         dropped = script.run("drop", ORDERLY_PG_YES="1")
         assert dropped.returncode == 0, dropped.stderr
         assert databases(script.url, other.prefix) == {
-            f"{other.prefix}_{s}" for s in ("orders", "payments", "notifications", "test")
+            f"{other.prefix}_{s}" for s in ("orders", "payments", "notifications", "monolith", "test")
         }
         assert databases(script.url, script.prefix) == set()
     finally:
