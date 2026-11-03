@@ -308,11 +308,17 @@ As built (`orderly.outbox`, day 2):
   awaited, so a batch costs about one round trip, not one per message. Rows whose publish failed (returned as
   unroutable, or no confirm within `publish_timeout`, 5 s) stay unpublished and are reported as one `RelayError`; the
   rest of the batch is still marked.
-- **A failed row waits for its own retry** (migration 0002): in the claim's transaction it gets `attempts + 1`, its
-  `last_error` (no NUL, at most 1,000 characters) and a `next_attempt_at` 0.5 s later, doubling to a minute, and the
-  claim skips rows whose time hasn't come. Without it (the day-2 review), `batch_size` rows that kept failing were
-  claimed again by every batch and nothing behind them was ever published; and the relay treated a partial failure as
-  an outage and backed off to 5 s, ignoring NOTIFY. A `RelayError` now backs nothing off: its rows already wait.
+- **A row that fails on its own waits for its own retry** (migration 0002). A failure is the row's own when the broker
+  returned the message (no binding takes its type) or the row isn't a message; then, in the claim's transaction, it
+  gets `attempts + 1`, its `last_error` (no NUL, no lone surrogate, at most 1,000 characters) and a `next_attempt_at`
+  0.5 s after the failure (`clock_timestamp()`, not the claim's `now()`), doubling to a minute, and the claims skip it
+  until then, with no relay backoff. Without it (the day-2 review), `batch_size` rows that kept failing were claimed
+  again by every batch and nothing behind them was ever published, and one failing row put every message on a 5 s
+  backoff.
+- **Any other failure is the broker's**: no confirm in time, a nack, a channel or connection closed. It is shared by
+  every row, so the rows are left as they were and the relay backs off as for an outage (0.1 s doubling to 5 s).
+  Charging it to each row (the first fix, caught by the review's second round) left every row waiting out its own
+  delay, up to a minute, after the broker had recovered.
 - **The loop**: `wake` is cleared before each batch (a NOTIFY while a batch runs means another pass); a full batch goes
   straight to the next; otherwise it waits for a NOTIFY, the poll interval (1 s) or the stop. Database and broker
   errors back off from 0.1 s, doubling to 5 s. The listener has its own connection, sets `wake` once right after

@@ -213,8 +213,10 @@ both publishing the same rows. The test runs two relays over 600 rows and gets e
 LOCKED` it fails.
 
 **What if one message can't be published?**
-It stays unpublished with `attempts`, `last_error` and a `next_attempt_at` (0.5 s, doubling to a minute); the rest of
-its batch is marked, and later claims skip it until its time, so it can't hold up the rows behind it. That was the
+If the failure is the row's own (the broker returned it as unroutable, or it doesn't decode), it stays unpublished
+with `attempts`, `last_error` and a `next_attempt_at` (0.5 s after the failure, doubling to a minute); the rest of its
+batch is marked, and later claims skip it until its time, so it can't hold up the rows behind it. If the failure is the
+broker's (no confirm, a nack, a closed channel), the rows are left alone and the relay backs off instead. That was the
 review's best finding: before, failed rows were just unpublished rows at the head of the id order, so 100 of them filled
 every batch and the outbox stopped for good; and the relay backed off for 5 s on any partial failure, ignoring
 NOTIFY, so one stuck row slowed every message.
@@ -290,6 +292,15 @@ the backoff, `FOR UPDATE` without `SKIP LOCKED` (correct but serial), clearing `
 a batch lost), no confirm timeout, the order service's relay not listening, `>=` at the 10^12-cent limit, and the
 look after `LISTEN` (already caught by a test written after the review's snapshot). Each has a test now, and each
 mutant re-applied fails it.
+
+**Did the fixes hold?**
+A second round looked only at the fixes and found two defects in the per-row retries. A broker-wide failure (a deleted
+exchange, confirms timing out) was charged to every row, so after the broker came back every row still sat out its own
+delay; and the wait was counted from the claim's `now()`, the start of its transaction, so a failure late in a slow
+batch was due again before it was recorded. The fix splits failures by whose they are: a returned (unroutable)
+message or an undecodable row is the row's own, and it waits; anything else is the broker's, the rows are left alone,
+and the relay backs off. And the wait starts at `clock_timestamp()`. As on day 1, the fixes were where the next bugs
+were.
 
 **What else did it suspect?**
 That the NOTIFY test was flaky: channels are per database and the tests share one, so another run's writes counted.
