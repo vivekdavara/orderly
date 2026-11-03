@@ -9,6 +9,8 @@ import os
 SERVICES = ("orders", "payments", "notifications", "monolith")
 # The monolith publishes and consumes nothing: it doesn't connect to RabbitMQ at all.
 WITHOUT_BROKER = frozenset({"monolith"})
+# The services that publish, through an outbox (the notification service only consumes).
+WITH_OUTBOX = frozenset({"orders", "payments"})
 
 
 def database_url(service: str) -> str:

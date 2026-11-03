@@ -191,3 +191,31 @@ async def test_the_service_relay_listens_so_a_command_goes_out_long_before_its_p
         assert (await service.order([("WIDGET-1", 1)])).status_code == 201
         await service.commands(1, timeout=2.0)
         assert time.monotonic() - started < 2.0
+
+
+async def test_health_reports_the_outbox_without_failing_on_it(service: OrderService) -> None:
+    """A backlog while the broker is down, and a row failing on its own, are reported, not made a 503: the instance
+    still takes orders. The broker being down is its own problem."""
+    resources: Resources = service.app.state.resources
+    assert resources.broker is not None
+    await resources.broker.close()
+    for _ in range(2):
+        assert (await service.order([("WIDGET-1", 1)])).status_code == 201
+    await asyncio.sleep(0.2)
+    body = (await service.client.get("/health")).json()
+    assert body["problems"] == {"broker": "connection closed"}
+    assert body["outbox"]["unpublished"] == 2 and body["outbox"]["failing"] == 0
+    assert 0.1 < body["outbox"]["oldest_seconds"] < 10
+
+
+async def test_health_counts_rows_that_fail_on_their_own(service: OrderService) -> None:
+    queue = await service.channel.get_queue(service.topology.queue("payment.commands"), ensure=False)
+    await queue.unbind(service.topology.commands, "payment.charge")  # every charge is now returned as unroutable
+    assert (await service.order([("WIDGET-1", 1)])).status_code == 201
+    deadline = time.monotonic() + 5
+    while (body := (await service.client.get("/health")).json())["outbox"]["failing"] == 0:
+        assert time.monotonic() < deadline, body
+        await asyncio.sleep(0.05)
+    assert body["status"] == "ok" and body["outbox"]["unpublished"] == 1 and body["outbox"]["failing"] == 1
+    await queue.bind(service.topology.commands, "payment.charge")
+    await service.commands(1, timeout=10.0)  # published at its next attempt

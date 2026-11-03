@@ -33,7 +33,7 @@ from fastapi.responses import JSONResponse
 from psycopg_pool import AsyncConnectionPool
 
 from orderly.broker import amqp_url
-from orderly.config import SERVICES, WITHOUT_BROKER, database_url
+from orderly.config import SERVICES, WITH_OUTBOX, WITHOUT_BROKER, database_url
 from orderly.migrate import migrate, migrations
 from orderly.topology import Topology
 
@@ -133,6 +133,24 @@ async def _stop(workers: list[asyncio.Task[None]], stop: asyncio.Event) -> None:
     await asyncio.gather(*workers, return_exceptions=True)
 
 
+async def _outbox_report(conn: psycopg.AsyncConnection[Any]) -> dict[str, Any]:
+    """What is waiting in the outbox: information, not a problem. A backlog while the broker is down is expected (the
+    broker's state is reported on its own), and an instance whose rows can't be published can still take orders, so
+    neither makes /health 503; `failing` (rows that failed on their own and wait for a retry) is what to alert on."""
+    row = await (
+        await conn.execute(
+            "SELECT count(*), count(*) FILTER (WHERE attempts > 0), extract(epoch FROM now() - min(created_at))"
+            " FROM outbox WHERE published_at IS NULL"
+        )
+    ).fetchone()
+    unpublished, failing, oldest = row if row is not None else (0, 0, None)
+    return {
+        "unpublished": unpublished,
+        "failing": failing,
+        "oldest_seconds": None if oldest is None else round(float(oldest), 3),
+    }
+
+
 def create_app(settings: Settings, *, router: APIRouter | None = None, workers: Sequence[Worker] = ()) -> FastAPI:
     if settings.service not in SERVICES:
         raise ValueError(f"unknown service {settings.service!r}")
@@ -183,10 +201,12 @@ def create_app(settings: Settings, *, router: APIRouter | None = None, workers: 
         try:
             async with asyncio.timeout(HEALTH_TIMEOUT), resources.pool.connection() as conn:
                 row = await (await conn.execute("SELECT max(version) FROM schema_migrations")).fetchone()
-            schema = row[0] if row else None
-            report["schema"] = schema
-            if schema != expected_schema:
-                problems["schema"] = f"database at migration {schema}, this code expects {expected_schema}"
+                schema = row[0] if row else None
+                report["schema"] = schema
+                if schema != expected_schema:
+                    problems["schema"] = f"database at migration {schema}, this code expects {expected_schema}"
+                elif settings.service in WITH_OUTBOX:
+                    report["outbox"] = await _outbox_report(conn)
         except (TimeoutError, psycopg.Error) as error:
             problems["database"] = f"{type(error).__name__}: {error}" if str(error) else type(error).__name__
         if resources.broker is None:

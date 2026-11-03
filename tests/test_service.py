@@ -31,13 +31,10 @@ async def test_a_started_service_has_migrated_and_is_healthy(
         response = await client.get("/health")
         assert response.status_code == 200, response.text
         latest = len(migrations(service))
-        assert response.json() == {
-            "service": service,
-            "schema_expected": latest,
-            "schema": latest,
-            "status": "ok",
-            "problems": {},
-        }
+        expected = {"service": service, "schema_expected": latest, "schema": latest, "status": "ok", "problems": {}}
+        if service in ("orders", "payments"):  # the services with an outbox
+            expected["outbox"] = {"unpublished": 0, "failing": 0, "oldest_seconds": None}
+        assert response.json() == expected
     with psycopg.connect(fresh_database) as conn:
         versions = conn.execute("SELECT version FROM schema_migrations ORDER BY 1").fetchall()
     assert versions == [(v,) for v in range(1, latest + 1)]
