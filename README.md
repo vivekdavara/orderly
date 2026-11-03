@@ -8,9 +8,10 @@ the monolith.
 
 Python 3.11, FastAPI, RabbitMQ 4.3 (aio-pika), PostgreSQL 14 (psycopg 3), pytest. MIT licensed.
 
-**Status: day 1 of 5.** The design, the message contracts, the RabbitMQ topology, the database schemas and their
-migrations, the local RabbitMQ and PostgreSQL scripts, and CI are done. The monolith and the services come on days 2
-and 3 ([DESIGN.md](DESIGN.md) "Days").
+**Status: day 2 of 5.** Day 1: the design, the message contracts, the RabbitMQ topology, the database schemas and
+their migrations, the local RabbitMQ and PostgreSQL scripts, CI. Day 2: the monolith baseline, the order service
+extracted from it, and the transactional outbox with its relay, so an order's `payment.charge` reaches the payment
+service's queue. The payment and notification services and the saga come on day 3 ([DESIGN.md](DESIGN.md) "Days").
 
 ## Architecture
 
@@ -37,20 +38,28 @@ flowchart LR
 [DESIGN.md](DESIGN.md) is the full specification: the monolith baseline and what it gets wrong, orchestration vs
 choreography, the saga's states, the message table, the topology, the outbox, the failure table.
 
-## What's here (day 1)
+## What's here
 
 | Path | What it is |
 |---|---|
+| `src/orderly/monolith.py` | The baseline (day 2): the whole order in one request and one transaction, the provider and the mailer called inside it |
+| `src/orderly/ordering.py` | Taking an order, shared by the monolith and the order service: request validation, Idempotency-Key replay, stock reserved in sku order |
+| `src/orderly/orders.py` | The order service (day 2): the order and its `payment.charge` written in one transaction; the outbox relay as its worker |
+| `src/orderly/outbox.py` | The transactional outbox: `write` in the change's transaction, `Relay` claiming in id order with `SKIP LOCKED`, publishing a batch, confirming, marking; LISTEN/NOTIFY wake-up |
+| `src/orderly/order_api.py` | `POST /orders` and `GET /orders/{id}`, the same for both apps |
+| `src/orderly/fakes.py`, `src/orderly/emails.py` | The deterministic fake payment provider and mailer; the two e-mails |
+| `src/orderly/seed.py` | A synthetic catalogue: `python -m orderly.seed orders` |
 | `src/orderly/messages.py` | The contract: a JSON envelope around seven typed payloads; `decode` is strict and says why it refuses, `encode` is canonical |
 | `docs/message-schema.json` | The same contract as a JSON Schema, generated from the code (`scripts/export_message_schema.py`) and checked by tests |
 | `src/orderly/topology.py` | Exchanges, quorum queues, dead-letter queues and bindings as code; `routes()` says where each type goes |
 | `src/orderly/broker.py` | Persistent, mandatory, confirmed publishing on a channel where a returned message is an error |
-| `src/orderly/service.py` | The skeleton every service shares: migrate and declare at startup, `/health` (200 only with its database, schema and broker right), ports 8112-8114 |
+| `src/orderly/service.py` | The skeleton every service shares: migrate and declare at startup, `/health` (200 only with its database, schema, broker and workers right), routes and background workers stopped by an event, every connection READ COMMITTED; ports 8112-8114 (the monolith takes 8112) |
 | `src/orderly/migrate.py`, `src/orderly/migrations/` | Numbered SQL migrations per service, applied in one transaction under an advisory lock; edited history refused |
 | `scripts/rabbitmq.sh` | A local RabbitMQ node on 127.0.0.1:5673, kept apart from any other RabbitMQ on the machine |
 | `scripts/postgres.sh` | Creates, migrates, lists and drops Orderly's databases on the local PostgreSQL 14 (`ORDERLY_PG_PREFIX` renames them) |
 | `scripts/measure_test_fixture.py` | Times CREATE DATABASE against CREATE SCHEMA (why each test gets a schema) |
-| `tests/` | 231 tests: unit, property and integration tests against the real servers |
+| `scripts/measure_relay.py`, `scripts/measure_intake.py` | The relay's throughput by batch size; order intake, monolith against order service, on one hot product |
+| `tests/` | 366 tests: unit, property and integration tests against the real servers |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
 ## Run it
@@ -64,12 +73,29 @@ make check             # ruff, ruff format --check, mypy --strict, pytest
 make services-down     # stop the RabbitMQ node (the databases stay)
 ```
 
-Run a service (it migrates its database and declares the topology first):
+Run the order service (it migrates its database and declares the topology first) with a synthetic catalogue, and
+place an order:
 
 ```bash
-.venv/bin/python -m orderly.service orders     # 127.0.0.1:8112; payments 8113, notifications 8114
-curl -s http://127.0.0.1:8112/health           # {"service":"orders","schema_expected":1,"schema":1,"status":"ok","problems":{}}
+.venv/bin/python -m orderly.seed orders                # SKU-0001..SKU-0100, 10,000 units each
+.venv/bin/python -m orderly.service orders             # 127.0.0.1:8112; payments 8113, notifications 8114
+curl -s http://127.0.0.1:8112/health                   # {"service":"orders","schema_expected":1,"schema":1,"status":"ok","problems":{}}
+curl -s -H 'content-type: application/json' -H 'Idempotency-Key: try-1' http://127.0.0.1:8112/orders \
+  -d '{"customer_id":"c-1","email":"ada@example.com","lines":[{"sku":"SKU-0001","quantity":2}]}'
 ```
+
+The answer is `201` with the order `AWAITING_PAYMENT`; its `payment.charge` is on the `payment.commands` queue (nothing
+consumes it until day 3). The same request again replays the order (`Idempotent-Replayed: true`). Or run the monolith
+instead, on the same port, where the order is charged and confirmed inside the request:
+
+```bash
+.venv/bin/python -m orderly.seed monolith
+ORDERLY_PROVIDER_LATENCY_MS=50 ORDERLY_PROVIDER_DECLINE_RATIO=0.1 .venv/bin/python -m orderly.service monolith
+```
+
+Settings: `ORDERLY_<SERVICE>_DATABASE_URL`, `ORDERLY_AMQP_URL`, `ORDERLY_POOL_SIZE` (10), `ORDERLY_POOL_TIMEOUT_S`
+(5), `ORDERLY_PAYMENT_TIMEOUT_S` (30, the order service's payment deadline), and the fake provider's
+`ORDERLY_PROVIDER_LATENCY_MS`, `ORDERLY_PROVIDER_DECLINE_RATIO`, `ORDERLY_PROVIDER_ERROR_RATIO` (0).
 
 The scripts on their own:
 
@@ -85,7 +111,40 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 231 tests in about 29 s here (more while the machine is busy):
+`make check` runs 366 tests in about 75 s here (`/usr/bin/time -p make check`: 74.6 s real at 16:18, load average 2.4; 30.7 s for day 1's 231). Day 2's:
+
+- **The monolith** (23, `tests/test_monolith.py`): confirmed (stock, payment, notification, e-mail), declined (402, stock back),
+  refused orders writing and charging nothing (out of stock, unknown sku, mixed currencies, a total over the limit),
+  malformed requests and keys; replays without a second charge, a reused key refused; ten concurrent requests under
+  one key making one order and one charge; a retry that waited for its own first attempt's stock getting the order,
+  not a 409; 12 orders racing for 3 units (3 confirmed, never oversold); 40 orders locking the same four products in
+  random orders without a deadlock (locking in request order deadlocks); a failing provider rolling back; a pool
+  timeout answering 503; and the two flaws, pinned: a failure after the charge keeps the charge and the retry charges
+  again, and two orders for one product take two provider latencies.
+- **Taking an order** (34, `tests/test_ordering.py`): what the request accepts and refuses, the fingerprint, the key's
+  characters.
+- **The outbox** (29, `tests/test_outbox.py`, real servers): the NOTIFY on commit only; id order; batch sizes; routing;
+  two relays publishing 600 rows exactly once (fails without `SKIP LOCKED`); a crash before the mark re-publishing
+  the same bytes; an unroutable row left while the rest of its batch is marked (fails if failed rows are marked); a
+  closed channel replaced; the NOTIFY waking a relay whose poll is 30 s; polling without a listener; a stop mid-batch
+  that still marks; backing off and recovering; a `CancelledError` from the broker library not ending the relay, a
+  real cancel ending it; a lost listener reconnecting, with a row written meanwhile going out at the reconnect;
+  another schema's writes not waking it; a failing row's own wait (0.5 s from the failure, doubling to a minute) and
+  error text; a missing confirm counted as the broker's, not the row's; a backlog draining without the poll; the
+  backoff reset; `SKIP LOCKED` letting a second relay take the next rows; a NOTIFY during a batch kept.
+- **The order service** (11, `tests/test_orders_service.py`): the order and its command end to end to the
+  `payment.commands` queue; the deadline; no command for a refused order or a replay; 50 concurrent orders, 50
+  commands; an outbox failure rolling the order back; orders taken while the broker is closed; a real connection drop,
+  then the outbox drained after the reconnect.
+- **The skeleton** (day 2's additions): the monolith never connecting to a broker, READ COMMITTED under a REPEATABLE
+  READ default, workers awaited at shutdown (cancelled only after the timeout, which outwaits any default batch), a
+  dead worker making `/health` 503. And DateStyle pinned to ISO (a review test).
+- **Fakes and seed** (23): deterministic declines and per-attempt errors, idempotent charges, the e-mails' wording
+  and integer money, the catalogue.
+- **The review's tests** (6, `tests/review_d2/` and `tests/review_d2r2/`): each failed on the code it was written
+  against and passes now.
+
+Day 1's:
 
 - **Messages** (84): the canonical bytes pinned; malformed inputs each refused for its own reason (duplicate keys,
   NaN, a full-width digit in a time, booleans and floats as integers, non-canonical UUIDs, a 5,000-digit number,
@@ -124,6 +183,37 @@ are skipped when it isn't there, except with `ORDERLY_REQUIRE_SERVICES=1` (CI se
 them. Each test isolates itself on the shared servers: a random prefix on every exchange and queue it declares, and a
 private schema in the test database.
 
+## Results (day 2)
+
+Measured on an Apple M3 laptop (macOS 26.6.2, on battery, load average 1.9-3.8), PostgreSQL 14.20, RabbitMQ 4.3.6,
+15:56-16:00 with nothing else using the servers. Synthetic data. Each script runs in process (the order intake through
+httpx's ASGI transport: no HTTP server or network in the path).
+
+| What | Measured (3 runs) | Command |
+|---|---|---|
+| Relay, 5,000 `payment.charge` rows, messages/s by batch size | batch 1: 974-1,002 (median 995); 10: 4,060-4,234 (4,154); 100: 6,296-6,470 (6,392); 500: 6,812-6,856 (6,854) | `.venv/bin/python scripts/measure_relay.py --messages 5000 --runs 3` |
+| The broker alone, 5,000 confirmed publishes, messages/s | each confirm awaited before the next: 3,039-3,138 (3,053); all published, then the confirms: 9,404-9,846 (9,716) | same run |
+| Order intake, one hot product, the monolith's provider at 50 ms, 1 client | monolith p50 58.8-59.6 ms, p99 63.2-65.2 ms, 16.8-17.0 orders/s; order service p50 1.5-1.6 ms, p99 2.4-2.9 ms, 596-643 orders/s | `.venv/bin/python scripts/measure_intake.py --orders 400 --provider-ms 50 --concurrency 1 20` |
+| The same, 20 clients | monolith p50 1,007-1,041 ms, p99 2.26-2.82 s, 16.9-17.1 orders/s; order service p50 25.3-29.1 ms, p99 66.7-76.2 ms, 607-685 orders/s | same run |
+
+A re-run of `measure_relay.py` at 16:20, after the review's second-round change to the relay, came out lower in every
+row (relay batch 100: median 5,335/s; the broker alone: 1,301 and 4,321/s), but another project's process was using
+about four cores by then (`ps -Ao pcpu,comm -r`) and the broker-alone rows, which don't run the relay at all, fell as
+much, so that run says nothing about the change. The change touches only the relay's failure paths.
+
+What they say:
+
+- **The monolith's hot product is capped by the provider**: about 17 orders/s with one client or twenty, which is one
+  order per provider call (50 ms) plus its own ~9 ms, because every order for that product waits for the previous
+  one's row lock. More clients only make the queue longer: p50 goes from 59 ms to about a second.
+- **The order service's number is intake, not confirmation**: it answers once the order and its command are committed,
+  without waiting for a payment, and on day 2 nothing confirms an order yet. The end-to-end comparison (accepted to
+  confirmed) is the day-4 load test, once the payment service exists. What this does show is that taking an order no
+  longer holds the product's row through a provider call.
+- **Batching is most of the relay's speed**: one message per batch costs a transaction and a confirm round trip each
+  (995/s); 100 per batch reaches 6,392/s. On the broker alone, publishing everything before awaiting the confirms is
+  3.2 times faster than awaiting each confirm in turn.
+
 ## Results (day 1)
 
 Measured on an Apple M3 laptop (macOS 26.6.2, on battery), PostgreSQL 14.20, RabbitMQ 4.3.6 (Erlang 28).
@@ -138,6 +228,36 @@ Measured on an Apple M3 laptop (macOS 26.6.2, on battery), PostgreSQL 14.20, Rab
 The second row is the day's most useful finding: on RabbitMQ 4, requeueing a message is "released", not "failed",
 so a consumer that requeues on a transient error would loop forever without the delivery limit ever stopping it. The
 retries (day 3) therefore never requeue: they go through wait queues with their own attempt count.
+
+## Review of day 2
+
+One review agent, in its own git worktree, read the day's code at `00ebdc4` (15:28-15:43) with a correctness brief and
+wrote each finding as a failing test (`tests/review_d2/`). Four defects, all fixed, each test failing before its fix and
+passing after:
+
+| Defect | Fix |
+|---|---|
+| Once `batch_size` outbox rows kept failing (an unroutable type), every claim took exactly those rows again: nothing behind them was ever published | per-row retries: `attempts`, `last_error`, `next_attempt_at` (migration 0002), claims skip rows still waiting (`3b571be`) |
+| One failing row put the whole relay on a backoff up to 5 s that ignored NOTIFY, for as long as it kept failing | a partial failure no longer backs the relay off (`3b571be`) |
+| A stop could cancel a batch between publish and mark: shutdown cancelled after 10 s, a batch could wait 10 s for its confirms, so a confirmed message was sent again after the restart | confirms 5 s, `STOP_TIMEOUT` 30 s, and a test of the margin (`1244d4e`) |
+| Under a DateStyle other than ISO every POST /orders failed (psycopg parses timestamptz only in ISO), after the monolith had charged | the pool pins DateStyle too (`a828a9a`) |
+
+Its eight surviving mutants (all in the relay but the 10^12-cent boundary) each have a test now and fail it when
+re-applied (`c957980`; the first, the look after `LISTEN`, was already caught by `b956811`). It suspected the NOTIFY
+test was flaky across concurrent runs sharing the test database, which holds: the payload names the schema now and a
+relay ignores other schemas (`32c0e05`). Its other suspicions are under Limitations. What held: no way found for an
+Idempotency-Key to give two orders, two charges or a wrong replay beyond the monolith's pinned flaw; stock re-checked
+under the pinned READ COMMITTED; locks always in sku order.
+
+A second round (one agent at `c957980`, 16:00-16:10, "what did the fixes break?") found two defects in the per-row
+retries, both fixed in `cf8109f`: a broker-wide failure (a deleted exchange, confirms timing out) was charged to every
+row, so after the broker recovered the rows kept waiting out their own delays (now only a row's own failure, an
+unroutable return or an undecodable row, is charged; anything else backs the relay off); and a failed row's wait was
+counted from the claim's `now()`, so a failure late in a slow batch was due before it was recorded (`clock_timestamp()`
+now). Its outage test is kept with its setup adapted (it waited for five charged attempts, which the fix no longer
+makes), and its timing test recast onto a row failure late in a slow batch, since a missing confirm is no longer the
+row's; both fail on the code before the fix. Its two surviving mutants and its lone-surrogate suspicion have tests. Its
+inferences that STOP_TIMEOUT isn't a hard bound are under Limitations.
 
 ## Review of day 1
 
@@ -184,16 +304,44 @@ connection and with the lock already held, `-1` really meaning no limit, cleanup
 - **The database enforces the invariants too** (stock never negative, a cancellation always has a reason, one payment
   per order...): the code is the first line, the schema the last.
 - **Migrations in one transaction under an advisory lock**, history checked by SHA-256 and refused if it differs.
+- **The monolith inserts the order before charging**, so the idempotency key is claimed first and a concurrent retry
+  waits instead of charging twice. Its remaining flaws are kept and pinned by tests: they are the baseline.
+- **One order-taking module for both apps**: the order service is literally the monolith's order-taking code with the
+  charge replaced by an outbox write, so the day-4 comparison measures the split, not two implementations.
+- **Re-check the idempotency key after a refusal**: a retry blocked behind its own first attempt sees "out of stock".
+- **Stock locked in sku order, READ COMMITTED pinned**: no deadlocks, and the `stock >= q` re-check after a wait.
+- **The relay publishes a batch, then awaits its confirms**, marks only what was confirmed, and is stopped by an event
+  between batches, never cancelled mid-batch.
+- **A `CancelledError` the task didn't ask for is a broker error**: aiormq raises one into an RPC's caller when the
+  connection closes; only `Task.cancelling()` says the task itself is being cancelled.
+- **A pool timeout is a 503 with Retry-After**, not a 500.
 
-## Limitations (day 1)
+## Limitations
 
-- No service logic yet: each service starts, migrates and reports health, nothing more. The monolith and the order
-  service are day 2, payment and notification day 3.
+- Nothing consumes `payment.commands` yet: the payment and notification services, the saga's reply handling and the
+  deadline sweeper are day 3. An order stays AWAITING_PAYMENT.
+- The monolith's flaws are deliberate (it is the baseline): a failure after the charge leaves the charge, and its retry
+  charges again.
+- An outbox row that can never be published (a type no binding routes) is retried forever, its wait doubling from
+  0.5 s to a minute, with `attempts` and `last_error` in its row; there is no parking place for it and no alert. It
+  doesn't hold up the rows behind it (the day-2 review found that it did).
+- `/health` says nothing about the outbox: a relay that is alive but whose rows keep failing reports healthy. The
+  outbox's depth and oldest row are worth exposing (day 4's measurements will want them too).
+- A batch's claim transaction stays open while it waits for confirms (5 s at most), so a server with
+  `idle_in_transaction_session_timeout` under that would end it and the batch would be published again.
+- Shutdown waits 30 s for a batch to finish, which covers the default pool wait and confirm wait (5 s each) but is not
+  a hard bound: a pool timeout set above about 10 s, a claim blocked on a table lock (a migration's `ALTER`), or a
+  channel open that hangs could push a batch past it, and the cancel could then land between publish and mark. That
+  re-sends a batch (at least once still holds); it doesn't lose one.
+- `last_error` is capped at 1,000 characters by a CHECK on `length()`, which counts characters in a UTF-8 database (all
+  of Orderly's) but bytes in a SQL_ASCII one.
+- `emails.money` writes two decimals for every currency (500 JPY would read "5.00 JPY"); every product is USD here.
+- The relay doesn't promise a global order across orders (ids are taken before commit); nothing relies on one.
+- The fakes keep their state in memory: restarting the monolith forgets its provider's charges.
 - The RabbitMQ script tests run only where RabbitMQ is installed; CI uses a service container and skips them.
 - One RabbitMQ node: quorum queues are replicated only on a cluster, which this project doesn't run.
-- The orders schema checks e-mails with PostgreSQL's `[:space:]`, the messages with Rust's `\s`; they differ on
-  U+0085 (locale-dependent), so the database could hold an e-mail no `order.confirmed` can carry. The order service
-  (day 2) will validate requests with the message types, leaving the database check as the backstop.
+- The orders schema checks e-mails with PostgreSQL's `[:space:]`, the messages with their own spelled-out set; the API
+  validates requests with the message types (day 2), so the database check is only the backstop.
 
 ## License
 
