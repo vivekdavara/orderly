@@ -196,8 +196,9 @@ afterwards, at least once.
 
 **Walk me through the relay.**
 `outbox.Relay.publish_batch`: in one transaction, claim up to 100 unpublished rows in id order `FOR UPDATE SKIP
-LOCKED`; publish all of them on a confirming channel, then wait for the confirms (10 s at most); mark the confirmed
-ones published; commit. `run` repeats it, sleeping between batches until a NOTIFY (sent by `outbox.write`, delivered
+LOCKED`, skipping rows still waiting for a retry; publish all of them on a confirming channel, then wait for the
+confirms (5 s at most); mark the confirmed ones published, and record each failed one's error and next attempt;
+commit. `run` repeats it, sleeping between batches until a NOTIFY (sent by `outbox.write`, delivered
 on commit), the 1 s poll, or the stop. Errors back off from 0.1 s to 5 s.
 
 **Can a message be lost? Published twice?**
@@ -212,16 +213,22 @@ both publishing the same rows. The test runs two relays over 600 rows and gets e
 LOCKED` it fails.
 
 **What if one message can't be published?**
-It stays, the rest of its batch is marked, and the batch raises `RelayError` so the loop backs off. The test unbinds a
-queue: that row stays, the other is marked, and after the binding returns the next batch publishes it.
+It stays unpublished with `attempts`, `last_error` and a `next_attempt_at` (0.5 s, doubling to a minute); the rest of
+its batch is marked, and later claims skip it until its time, so it can't hold up the rows behind it. That was the
+review's best finding: before, failed rows were just unpublished rows at the head of the id order, so 100 of them filled
+every batch and the outbox stopped for good; and the relay backed off for 5 s on any partial failure, ignoring
+NOTIFY, so one stuck row slowed every message.
 
 **Why publish a whole batch before waiting for any confirm?**
 One round trip per batch instead of per message. `scripts/measure_relay.py` measures it (README "Results (day 2)").
 
 **What does "a stop never cancels a mark" mean in code?**
 The relay checks its stop event only between batches; the service skeleton's shutdown sets the event and waits up to
-10 s for the workers before cancelling anything. A test stops the relay while a batch is being published: the batch
-still gets marked, so the next start doesn't send it again.
+30 s for the workers before cancelling anything. A test stops the relay while a batch is being published: the batch
+still gets marked, so the next start doesn't send it again. The 30 s is not arbitrary: a batch can wait 5 s for a
+pooled connection and 5 s for its confirms. It was 10 s against a 10 s confirm wait until the review showed a stop
+landing as a batch started cancelling it after one message was confirmed, so that message was sent again after the
+restart. A test now checks the margin.
 
 **How did the relay die, and what did you change?**
 Two ways, both found running it inside the order service. aiormq raises `CancelledError` into whoever is awaiting an
@@ -267,6 +274,27 @@ re-applied them): boundaries
 (`MAX_CENTS`, 254 characters, a zero refund), spellings (uppercase in a UUID's last group, five fractional digits),
 the queue arguments, exchange types, whitespace-only edits to a migration. Each has a test now, and I re-applied each
 mutant to see it fail.
+
+## The review (day 2)
+
+**What did the review find?**
+One agent, in its own worktree, with a correctness brief and findings as failing tests (`tests/review_d2/`). Four
+defects, all fixed: rows that kept failing blocked the whole outbox once there were a batch of them; one stuck row put
+every message on a 5 s backoff; a stop could cancel a batch between publish and mark (the 10 s against 10 s above);
+and a database whose DateStyle isn't ISO made every order fail, after the monolith had charged, because psycopg parses
+timestamptz text only in ISO (the pool pins DateStyle now, as it pins the isolation level).
+
+**And the mutants?**
+Eight changes the suite didn't notice, all in the relay but one: never going straight to the next batch, not resetting
+the backoff, `FOR UPDATE` without `SKIP LOCKED` (correct but serial), clearing `wake` before waiting (a NOTIFY during
+a batch lost), no confirm timeout, the order service's relay not listening, `>=` at the 10^12-cent limit, and the
+look after `LISTEN` (already caught by a test written after the review's snapshot). Each has a test now, and each
+mutant re-applied fails it.
+
+**What else did it suspect?**
+That the NOTIFY test was flaky: channels are per database and the tests share one, so another run's writes counted.
+The payload names the schema now. Its other suspicions are limitations in the README: `/health` doesn't see a stuck
+outbox, a short `idle_in_transaction_session_timeout` would cut a batch, and two decimals for every currency.
 
 ## What went wrong on day 1
 
