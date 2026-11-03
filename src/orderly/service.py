@@ -90,11 +90,18 @@ def _migrate(url: str, service: str) -> list[int]:
         return migrate(conn, service)
 
 
-async def _read_committed(conn: psycopg.AsyncConnection[Any]) -> None:
-    """Every transaction READ COMMITTED, whatever the database's default: the services' SQL (a reservation's
-    `UPDATE ... WHERE stock >= q`, the outbox claim) is written for it. Under REPEATABLE READ a reservation racing
-    another for the same product would fail with a serialization error instead of waiting and re-checking."""
+async def _configure(conn: psycopg.AsyncConnection[Any]) -> None:
+    """Pin the server settings the services' code depends on, whatever the database's or role's defaults.
+
+    - READ COMMITTED: the services' SQL (a reservation's `UPDATE ... WHERE stock >= q`, the outbox claim) is written for
+      it. Under REPEATABLE READ a reservation racing another for the same product fails with a serialization error
+      instead of waiting and re-checking.
+    - DateStyle ISO: psycopg parses timestamptz text only in ISO; under 'SQL, DMY' reading any order raised
+      NotImplementedError, after the monolith had charged (day-2 review).
+    """
     await conn.set_isolation_level(psycopg.IsolationLevel.READ_COMMITTED)
+    await conn.execute("SET DateStyle = ISO")
+    await conn.commit()  # the pool refuses a connection its configure callback left inside a transaction
 
 
 @asynccontextmanager
@@ -142,7 +149,7 @@ def create_app(settings: Settings, *, router: APIRouter | None = None, workers: 
                 timeout=settings.pool_timeout,
                 open=False,
                 check=AsyncConnectionPool.check_connection,
-                configure=_read_committed,
+                configure=_configure,
             )
             try:
                 # Inside the try: a pool whose first connections time out still has workers retrying them, and
