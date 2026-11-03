@@ -267,3 +267,27 @@ async def test_the_baselines_flaw_the_providers_latency_is_paid_with_the_rows_lo
     different_products = time.perf_counter() - started
     assert same_product >= 0.6, same_product
     assert different_products < 0.6, different_products
+
+
+async def test_a_request_that_cant_get_a_connection_in_time_is_a_503_not_a_500(fresh_database: str) -> None:
+    """The monolith holds a pooled connection through the provider's latency: with one connection and a 0.5 s
+    provider, a second order waits for the pool, and after its timeout is told to retry."""
+    provider = FakeProvider(latency=0.5)
+    settings = Settings("monolith", fresh_database, "amqp://unused/", pool_size=1, pool_timeout=0.2)
+    async with running(monolith.create_app(settings, provider=provider)) as client:
+        stock(fresh_database, [("A-1", 100, 10), ("B-1", 100, 10)])
+
+        async def order(sku: str) -> httpx.Response:
+            body = {"customer_id": "c-1", "email": "a@example.com", "lines": [{"sku": sku, "quantity": 1}]}
+            return await client.post("/orders", json=body)
+
+        first, second = await asyncio.gather(order("A-1"), order("B-1"))
+        assert first.status_code == 201, first.text
+        assert second.status_code == 503 and second.headers["retry-after"] == "1"
+        assert second.json()["detail"]["error"] == "database_busy"
+        slow_read = asyncio.create_task(order("A-1"))
+        await asyncio.sleep(0.05)  # holding the only connection for 0.5 s
+        busy = await client.get(f"/orders/{first.json()['id']}")
+        assert busy.status_code == 503 and busy.json()["detail"]["error"] == "database_busy"
+        assert (await slow_read).status_code == 201
+    assert count(fresh_database, "orders") == 2

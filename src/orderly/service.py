@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import importlib
 import logging
+import os
 from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -53,10 +54,20 @@ class Settings:
     database_url: str
     amqp_url: str
     topology: Topology = field(default_factory=Topology)
+    # The database pool: its size, and how long a request waits for a connection before it is refused with 503.
+    pool_size: int = 10
+    pool_timeout: float = 5.0
 
     @classmethod
     def from_environment(cls, service: str) -> Settings:
-        return cls(service=service, database_url=database_url(service), amqp_url=amqp_url())
+        """ORDERLY_POOL_SIZE and ORDERLY_POOL_TIMEOUT_S override the pool's defaults."""
+        return cls(
+            service=service,
+            database_url=database_url(service),
+            amqp_url=amqp_url(),
+            pool_size=int(os.environ.get("ORDERLY_POOL_SIZE", "10")),
+            pool_timeout=float(os.environ.get("ORDERLY_POOL_TIMEOUT_S", "5")),
+        )
 
 
 @dataclass
@@ -127,7 +138,8 @@ def create_app(settings: Settings, *, router: APIRouter | None = None, workers: 
             pool = AsyncConnectionPool(
                 settings.database_url,
                 min_size=1,
-                max_size=10,
+                max_size=settings.pool_size,
+                timeout=settings.pool_timeout,
                 open=False,
                 check=AsyncConnectionPool.check_connection,
                 configure=_read_committed,

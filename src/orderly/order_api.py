@@ -15,6 +15,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
+from psycopg_pool import PoolTimeout
 
 from orderly import ordering
 from orderly.ordering import OrderRefused, OrderRequest, OrderView, Write
@@ -28,8 +29,9 @@ def router(
     unavailable: Mapping[type[Exception], str] | None = None,
 ) -> APIRouter:
     """`write_for(request, key)` gives the write for one request; `unavailable` maps the exceptions of a dependency
-    that is down (the provider, the mailer) to the error name of a 503, which tells the client to retry."""
-    errors = dict(unavailable or {})
+    that is down (the provider, the mailer) to the error name of a 503, which tells the client to retry. A request
+    that waited the pool's timeout for a database connection is a 503 too, rather than a 500."""
+    errors: dict[type[Exception], str] = {PoolTimeout: "database_busy", **(unavailable or {})}
     routes = APIRouter()
 
     @routes.post("/orders")
@@ -51,8 +53,15 @@ def router(
 
     @routes.get("/orders/{order_id}")
     async def get_order(request: Request, order_id: uuid.UUID) -> JSONResponse:
-        async with request.app.state.resources.pool.connection() as conn:
-            order = await ordering.read_order(conn, order_id)
+        try:
+            async with request.app.state.resources.pool.connection() as conn:
+                order = await ordering.read_order(conn, order_id)
+        except PoolTimeout as error:
+            return JSONResponse(
+                {"detail": {"error": "database_busy", "message": str(error)}},
+                status_code=503,
+                headers={"Retry-After": "1"},
+            )
         if order is None:
             return JSONResponse({"detail": {"error": "not_found", "message": f"no order {order_id}"}}, status_code=404)
         return JSONResponse(order.model_dump(mode="json"))
