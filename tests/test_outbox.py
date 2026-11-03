@@ -10,6 +10,7 @@ from datetime import timedelta
 from typing import Any
 
 import psycopg
+import psycopg.conninfo
 import pytest
 from aio_pika.abc import AbstractChannel, AbstractConnection
 from psycopg_pool import AsyncConnectionPool
@@ -85,15 +86,19 @@ async def test_write_adds_the_canonical_bytes_with_the_type(pool: AsyncConnectio
 async def test_the_notify_is_sent_on_commit_and_not_on_rollback(fresh_database: str, pool: AsyncConnectionPool) -> None:
     async with await psycopg.AsyncConnection.connect(fresh_database, autocommit=True) as listener:
         await listener.execute(f"LISTEN {outbox.CHANNEL}")
+        row = await (await listener.execute("SELECT current_schema()")).fetchone()
+        assert row is not None and row[0].startswith("t_")
+        schema = row[0]
         with pytest.raises(ZeroDivisionError):
             async with pool.connection() as conn, conn.transaction():
                 await outbox.write(conn, charge())
                 raise ZeroDivisionError
-        assert [n async for n in listener.notifies(timeout=0.3)] == []
+        # Only this schema's: other tests (or a review running beside this suite) share the database and the channel.
+        assert [n async for n in listener.notifies(timeout=0.3) if n.payload == schema] == []
         await write_all(pool, [charge(), charge()])
-        received = [n async for n in listener.notifies(timeout=0.3)]
-    # Two writes in one transaction: PostgreSQL folds identical notifications into one.
-    assert [n.channel for n in received] == [outbox.CHANNEL]
+        received = [n async for n in listener.notifies(timeout=0.3) if n.payload == schema]
+    # Two writes in one transaction: PostgreSQL folds identical notifications into one. The payload names the schema.
+    assert [(n.channel, n.payload) for n in received] == [(outbox.CHANNEL, schema)]
 
 
 async def test_a_batch_is_published_in_id_order_and_marked(
@@ -432,3 +437,52 @@ def test_last_error_holds_no_nul_and_at_most_1000_characters() -> None:
     assert outbox.describe(ValueError("bad\x00byte")) == "ValueError: bad\\0byte"
     long = outbox.describe(ValueError("é" * 2000))
     assert len(long) == 1000 and long.startswith("ValueError: éé")
+
+
+async def test_another_schemas_writes_dont_wake_the_relay(
+    fresh_database: str,
+    test_database: str,
+    pool: AsyncConnectionPool,
+    connection: AbstractConnection,
+    topology: Topology,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relay counts its batches; writes to another schema's outbox in the same database (the channel is per
+    database) don't make it claim again before its poll."""
+    batches = []
+    real_batch = Relay.publish_batch
+
+    async def counting(self: Relay) -> int:
+        batches.append(1)
+        return await real_batch(self)
+
+    monkeypatch.setattr(Relay, "publish_batch", counting)
+    other = f"t_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(test_database, autocommit=True) as admin:
+        admin.execute(f"CREATE SCHEMA {other}")
+    try:
+        other_url = psycopg.conninfo.make_conninfo(test_database, options=f"-c search_path={other}")
+        with psycopg.connect(other_url, autocommit=True) as conn:
+            migrate(conn, "orders")
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            relay(pool, connection, topology, listen_url=fresh_database, poll_interval=30.0).run(stop)
+        )
+        try:
+            await asyncio.sleep(0.3)
+            before = len(batches)
+            async with await psycopg.AsyncConnection.connect(other_url) as other_conn:
+                for _ in range(3):
+                    async with other_conn.transaction():
+                        await outbox.write(other_conn, charge())
+            await asyncio.sleep(0.3)
+            assert len(batches) == before
+            await write_all(pool, [charge()])  # its own schema's write does
+            await asyncio.sleep(0.3)
+            assert len(batches) > before
+        finally:
+            stop.set()
+            await asyncio.wait_for(task, timeout=5)
+    finally:
+        with psycopg.connect(test_database, autocommit=True) as admin:
+            admin.execute(f"DROP SCHEMA {other} CASCADE")

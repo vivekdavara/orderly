@@ -36,7 +36,9 @@ from orderly import broker
 from orderly.messages import Message, decode, encode
 from orderly.topology import Topology
 
-# The LISTEN/NOTIFY channel. One per database, and each service has its own database.
+# The LISTEN/NOTIFY channel. Channels are per database, so the payload names the outbox's schema and a relay ignores
+# other schemas' notifications: each service has its own database, but the tests share one with a schema each, and a
+# relay woken by another schema's writes (or a test expecting silence) was flaky under concurrent runs (day-2 review).
 CHANNEL = "orderly_outbox"
 # The relay's backoff after an error outside a batch's publishes (the database, the broker connection).
 MIN_BACKOFF = 0.1
@@ -55,7 +57,7 @@ async def write(conn: psycopg.AsyncConnection[Any], message: Message) -> None:
         "INSERT INTO outbox (message_id, message_type, body) VALUES (%s, %s, %s)",
         (message.message_id, message.type, encode(message)),
     )
-    await conn.execute("SELECT pg_notify(%s, '')", (CHANNEL,))
+    await conn.execute("SELECT pg_notify(%s, current_schema())", (CHANNEL,))
 
 
 class RelayError(Exception):
@@ -205,17 +207,21 @@ class Relay:
                 await asyncio.gather(listener, return_exceptions=True)
 
     async def _listen(self, url: str, wake: asyncio.Event, stop: asyncio.Event) -> None:
-        """Set `wake` on every NOTIFY; reconnect after a lost connection (polling covers the gap)."""
+        """Set `wake` on every NOTIFY for this outbox's schema; reconnect after a lost connection (polling covers the
+        gap)."""
         while not stop.is_set():
             try:
                 async with await psycopg.AsyncConnection.connect(url, autocommit=True) as conn:
                     await conn.execute(f"LISTEN {CHANNEL}")
+                    row = await (await conn.execute("SELECT current_schema()")).fetchone()
+                    schema = None if row is None else row[0]
                     self.listener_pid = conn.info.backend_pid
                     # A row committed before LISTEN took effect (at startup, or while the listener was down) sent its
                     # NOTIFY to no one: look once now.
                     wake.set()
-                    async for _ in conn.notifies():
-                        wake.set()
+                    async for notification in conn.notifies():
+                        if notification.payload == schema:
+                            wake.set()
             except psycopg.Error as error:
                 self.listener_pid = None
                 log.warning("outbox relay: listener lost (%s); polling until it reconnects", error)
