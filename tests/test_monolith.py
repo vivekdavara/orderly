@@ -309,3 +309,10 @@ async def test_racing_orders_behave_the_same_under_a_repeatable_read_default(fre
         responses = await asyncio.gather(*(client.post("/orders", json=body) for _ in range(12)))
     assert sorted(response.status_code for response in responses) == [201] * 3 + [409] * 9
     assert stock_of(url, "GADGET-2") == 0
+
+
+async def test_a_total_of_exactly_the_limit_is_accepted(shop: Monolith) -> None:
+    # 10^12 cents: the largest total the schema and the messages accept; one more is refused (above).
+    response = await shop.order([("HUGE-1", 1)])
+    assert response.status_code == 201, response.text
+    assert response.json()["total_cents"] == 10**12

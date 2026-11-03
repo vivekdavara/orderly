@@ -177,3 +177,17 @@ async def test_after_a_broker_drop_the_relay_reconnects_and_drains_the_outbox(
         assert outbox_rows(fresh_database) == [("payment.charge", True)] * 4
         assert [task.done() for task in resources.workers] == [False]
         assert (await client.get("/health")).json()["problems"] == {}
+
+
+async def test_the_service_relay_listens_so_a_command_goes_out_long_before_its_poll(
+    fresh_database: str, topology: Topology, channel: AbstractChannel
+) -> None:
+    app = orders.create_app(Settings("orders", fresh_database, amqp_url(), topology), poll_interval=30.0)
+    async with running(app) as client:
+        stock(fresh_database, [("WIDGET-1", 2599, 10)])
+        service = OrderService(client, app, fresh_database, topology, channel)
+        await asyncio.sleep(0.3)  # the relay's first batch is done; it sleeps until a NOTIFY or 30 s
+        started = time.monotonic()
+        assert (await service.order([("WIDGET-1", 1)])).status_code == 201
+        await service.commands(1, timeout=2.0)
+        assert time.monotonic() - started < 2.0

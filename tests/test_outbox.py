@@ -486,3 +486,138 @@ async def test_another_schemas_writes_dont_wake_the_relay(
     finally:
         with psycopg.connect(test_database, autocommit=True) as admin:
             admin.execute(f"DROP SCHEMA {other} CASCADE")
+
+
+# The rest kill mutants of outbox.py that the day-2 review found no test noticed.
+
+
+class HeldRelay(Relay):
+    """A relay whose publishes wait for `release` while `hold` is set."""
+
+    hold: asyncio.Event
+    release: asyncio.Event
+    holding: asyncio.Event
+
+    async def _publish(self, channel: AbstractChannel, body: bytes) -> None:
+        if self.hold.is_set():
+            self.holding.set()
+            await self.release.wait()
+        await super()._publish(channel, body)
+
+
+def held(pool: AsyncConnectionPool, connection: AbstractConnection, topology: Topology, **options: Any) -> HeldRelay:
+    r = HeldRelay(pool=pool, connection=connection, topology=topology, **options)
+    r.hold, r.release, r.holding = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    r.hold.set()
+    return r
+
+
+async def test_a_backlog_drains_batch_after_batch_without_waiting_for_the_poll(
+    fresh_database: str,
+    pool: AsyncConnectionPool,
+    connection: AbstractConnection,
+    channel: AbstractChannel,
+    topology: Topology,
+) -> None:
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        relay(pool, connection, topology, listen_url=fresh_database, batch_size=50, poll_interval=30.0).run(stop)
+    )
+    try:
+        await asyncio.sleep(0.3)
+        await write_all(pool, [charge(n) for n in range(220)])  # one NOTIFY, five batches
+        assert await wait_until_published(pool, timeout=5.0) < 3.0
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=5)
+    await drain(channel, topology.queue("payment.commands"), 220)
+
+
+async def test_the_backoff_starts_again_from_the_minimum_after_a_success(
+    pool: AsyncConnectionPool, connection: AbstractConnection, topology: Topology, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[float] = []
+
+    async def flaky(self: Relay) -> int:
+        calls.append(time.perf_counter())
+        if len(calls) <= 5 or len(calls) == 7:  # five failures (backoff up to 1.6 s), a success, one more failure
+            raise psycopg.OperationalError("the database went away")
+        return 0
+
+    monkeypatch.setattr(Relay, "publish_batch", flaky)
+    stop = asyncio.Event()
+    task = asyncio.create_task(relay(pool, connection, topology, poll_interval=0.05).run(stop))
+    try:
+        for _ in range(500):
+            if len(calls) >= 8:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=10)
+    assert len(calls) >= 8
+    assert calls[5] - calls[4] > 1.5  # the fifth failure's backoff: 1.6 s
+    assert calls[7] - calls[6] < 0.5  # after the success: 0.1 s again, not 3.2 s
+
+
+async def test_a_second_relay_takes_the_next_rows_instead_of_waiting_for_the_first(
+    pool: AsyncConnectionPool, connection: AbstractConnection, channel: AbstractChannel, topology: Topology
+) -> None:
+    await write_all(pool, [charge(n) for n in range(20)])
+    first = held(pool, connection, topology, batch_size=10)
+    first_batch = asyncio.create_task(first.publish_batch())
+    try:
+        await asyncio.wait_for(first.holding.wait(), timeout=5)  # rows 1-10 claimed and locked
+        # SKIP LOCKED: the second relay claims rows 11-20 at once; with plain FOR UPDATE it would wait on row 1.
+        assert await asyncio.wait_for(relay(pool, connection, topology, batch_size=10).publish_batch(), timeout=3) == 10
+    finally:
+        first.release.set()
+    assert await asyncio.wait_for(first_batch, timeout=5) == 10
+    await drain(channel, topology.queue("payment.commands"), 20)
+
+
+async def test_a_notify_that_arrives_during_a_batch_is_not_lost(
+    fresh_database: str,
+    pool: AsyncConnectionPool,
+    connection: AbstractConnection,
+    channel: AbstractChannel,
+    topology: Topology,
+) -> None:
+    await write_all(pool, [charge()])
+    r = held(pool, connection, topology, listen_url=fresh_database, poll_interval=30.0)
+    stop = asyncio.Event()
+    task = asyncio.create_task(r.run(stop))
+    try:
+        await asyncio.wait_for(r.holding.wait(), timeout=5)  # the first batch is publishing
+        r.hold.clear()
+        await write_all(pool, [charge()])  # committed (and notified) while the batch runs
+        await asyncio.sleep(0.2)
+        r.release.set()
+        assert await wait_until_published(pool, timeout=5.0) < 2.0  # not at the 30 s poll
+    finally:
+        r.release.set()
+        stop.set()
+        await asyncio.wait_for(task, timeout=5)
+    await drain(channel, topology.queue("payment.commands"), 2)
+
+
+async def test_a_confirm_that_never_comes_gives_up_after_publish_timeout(
+    pool: AsyncConnectionPool, connection: AbstractConnection, channel: AbstractChannel, topology: Topology
+) -> None:
+    class OneHangs(Relay):
+        async def _publish(self, channel: AbstractChannel, body: bytes) -> None:
+            if body == encode(stuck):
+                await asyncio.sleep(3600)
+            await super()._publish(channel, body)
+
+    stuck, fine = charge(), charge()
+    await write_all(pool, [stuck, fine])
+    r = OneHangs(pool=pool, connection=connection, topology=topology, publish_timeout=0.2)
+    started = time.perf_counter()
+    with pytest.raises(
+        RelayError, match=r"1 not published, first outbox row 1: TimeoutError: no confirm within 0\.2 s"
+    ):
+        await asyncio.wait_for(r.publish_batch(), timeout=5)
+    assert time.perf_counter() - started < 1.0
+    assert await drain(channel, topology.queue("payment.commands"), 1) == [encode(fine)]
+    assert await unpublished(pool) == 1
