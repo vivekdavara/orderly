@@ -258,3 +258,14 @@ async def test_routes_are_added_to_the_skeleton(fresh_database: str, topology: T
 
     async with running(create_app(settings(fresh_database, topology), router=router)) as client:
         assert (await client.get("/ping")).json() == {"pong": "yes"}
+
+
+def test_shutdown_waits_longer_than_any_relay_batch_can_last() -> None:
+    """A relay batch waits at most pool_timeout for a connection and publish_timeout for its confirms; shutdown must
+    outwait both, with room for the claim and the mark, or a stop cancels a batch between publishing and marking it
+    (the day-2 review's test_stop_timeout_cancels_the_mark shows it at 10 s against 10 s)."""
+    from orderly.outbox import Relay
+
+    publish_timeout = Relay.__dataclass_fields__["publish_timeout"].default
+    assert isinstance(publish_timeout, float)
+    assert 2 * (Settings("orders", "", "").pool_timeout + publish_timeout) <= service.STOP_TIMEOUT

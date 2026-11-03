@@ -86,7 +86,8 @@ class Relay:
     batch_size: int = 100
     poll_interval: float = 1.0
     # How long a batch waits for its confirms before giving up on the missing ones (they are published again later).
-    publish_timeout: float = 10.0
+    # Well inside service.STOP_TIMEOUT, so a shutdown waits for the batch instead of cancelling it.
+    publish_timeout: float = 5.0
     _channel: AbstractChannel | None = field(default=None, init=False, repr=False)
     # The listener's server process id while it is connected (tests end it to simulate a lost connection).
     listener_pid: int | None = field(default=None, init=False)

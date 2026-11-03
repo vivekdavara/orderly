@@ -40,8 +40,11 @@ from orderly.topology import Topology
 PORTS = {"orders": 8112, "payments": 8113, "notifications": 8114, "monolith": 8112}
 # How long /health waits for the database before calling it down.
 HEALTH_TIMEOUT = 2.0
-# How long shutdown waits for the workers to finish after asking them to stop, before cancelling them.
-STOP_TIMEOUT = 10.0
+# How long shutdown waits for the workers to finish after asking them to stop, before cancelling them. Longer than any
+# relay batch can last (its wait for a pooled connection, Settings.pool_timeout, plus its wait for confirms,
+# Relay.publish_timeout, 5 s each), so a stop never cancels a batch between publishing and marking it: at 10 s, equal
+# to the confirm wait then, it did (day-2 review). A test checks the margin.
+STOP_TIMEOUT = 30.0
 # The module whose create_app builds each service's app; the others are the bare skeleton until they have one.
 BUILDERS = {"orders": "orderly.orders", "monolith": "orderly.monolith"}
 
