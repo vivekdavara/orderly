@@ -356,3 +356,38 @@ async def test_a_real_cancel_still_ends_the_relay(
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=5)
     assert task.cancelled()
+
+
+async def test_a_lost_listener_reconnects_and_a_row_written_meanwhile_goes_out_at_the_reconnect(
+    fresh_database: str,
+    test_database: str,
+    pool: AsyncConnectionPool,
+    connection: AbstractConnection,
+    channel: AbstractChannel,
+    topology: Topology,
+) -> None:
+    """The listener's connection ends (a database restart, an idle timeout): the relay reconnects it after 1 s and
+    looks once, so a row written while it was down goes out then, not at the 30 s poll; and NOTIFY works again."""
+    stop = asyncio.Event()
+    r = relay(pool, connection, topology, listen_url=fresh_database, poll_interval=30.0)
+    task = asyncio.create_task(r.run(stop))
+    try:
+        for _ in range(100):
+            if r.listener_pid is not None:
+                break
+            await asyncio.sleep(0.02)
+        first_pid = r.listener_pid
+        assert first_pid is not None
+        # Exactly the relay's own listener, by its pid (other tests share the server).
+        with psycopg.connect(test_database, autocommit=True) as admin:
+            assert admin.execute("SELECT pg_terminate_backend(%s)", (first_pid,)).fetchone() == (True,)
+        await asyncio.sleep(0.1)
+        await write_all(pool, [charge()])  # no one is listening now
+        assert 0.5 < await wait_until_published(pool, timeout=5.0) < 3.0  # at the reconnect, about 1 s later
+        assert r.listener_pid not in (None, first_pid)
+        await write_all(pool, [charge()])
+        assert await wait_until_published(pool, timeout=5.0) < 1.0  # by NOTIFY again
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=5)
+    await drain(channel, topology.queue("payment.commands"), 2)

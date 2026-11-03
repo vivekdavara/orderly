@@ -76,6 +76,8 @@ class Relay:
     # How long a batch waits for its confirms before giving up on the missing ones (they are published again later).
     publish_timeout: float = 10.0
     _channel: AbstractChannel | None = field(default=None, init=False, repr=False)
+    # The listener's server process id while it is connected (tests end it to simulate a lost connection).
+    listener_pid: int | None = field(default=None, init=False)
 
     async def _open_channel(self) -> AbstractChannel:
         if self.connection.is_closed:
@@ -183,11 +185,14 @@ class Relay:
             try:
                 async with await psycopg.AsyncConnection.connect(url, autocommit=True) as conn:
                     await conn.execute(f"LISTEN {CHANNEL}")
-                    # A row committed before LISTEN took effect sent its NOTIFY to no one: look once now.
+                    self.listener_pid = conn.info.backend_pid
+                    # A row committed before LISTEN took effect (at startup, or while the listener was down) sent its
+                    # NOTIFY to no one: look once now.
                     wake.set()
                     async for _ in conn.notifies():
                         wake.set()
             except psycopg.Error as error:
+                self.listener_pid = None
                 log.warning("outbox relay: listener lost (%s); polling until it reconnects", error)
                 await _wait(stop, timeout=1.0)
 
