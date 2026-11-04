@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 
 import aio_pika
+import aiormq
 import psycopg
 import pytest
 from aio_pika.abc import AbstractChannel, AbstractConnection
@@ -380,3 +381,27 @@ async def test_a_broker_that_never_answers_the_cancel_does_not_hold_the_stop(
     started = time.monotonic()
     await run.finish()
     assert time.monotonic() - started < 3
+
+
+async def test_a_cancel_on_a_channel_closed_under_it_still_drains_the_handlers(
+    start: Start,
+    channel: AbstractChannel,
+    short_topology: Topology,
+    fresh_database: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The day-3 review's unproven suspicion: the channel closing between the check and basic.cancel raises
+    ChannelInvalidStateError (a RuntimeError), which skipped the drain, so a handler in flight was cut off."""
+
+    async def closed(*_: object, **__: object) -> None:
+        raise aiormq.exceptions.ChannelInvalidStateError("<Channel> closed")
+
+    monkeypatch.setattr(aio_pika.queue.Queue, "cancel", closed)
+    message = charge()
+    toy = Toy(stall=0.5)
+    run = await start(toy)
+    await publish(channel, short_topology, message)
+    await run.until(lambda: toy.calls[message.message_id] == 1)
+    await run.finish()  # raises if the RuntimeError escaped run
+    assert run.consumer.stats["handled"] == 1
+    assert effects(fresh_database) == [(message.message_id, 2599)]

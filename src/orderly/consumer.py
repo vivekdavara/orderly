@@ -133,15 +133,22 @@ class Consumer:
 
         channel.close_callbacks.add(on_close)
         try:
-            await channel.set_qos(prefetch_count=self.prefetch)
-            queue = await channel.get_queue(self.topology.queue(self.queue), ensure=False)
-            tag = await queue.consume(self._on_delivery)
+            try:
+                await channel.set_qos(prefetch_count=self.prefetch)
+                queue = await channel.get_queue(self.topology.queue(self.queue), ensure=False)
+                tag = await queue.consume(self._on_delivery)
+            except RuntimeError as error:
+                # aiormq's ChannelInvalidStateError ("<Channel> closed") is a RuntimeError, not an AMQPError: a channel
+                # the broker closed between the open and the subscription killed the consumer for good (day-3
+                # review). It is a broker failure like the others: back off and subscribe on a new channel.
+                raise ConnectionError(f"the channel closed before the subscription: {error}") from error
             while not stop.is_set() and not lost.is_set() and not channel.is_closed:
                 await wait_any(stop, lost, timeout=0.5)
             if not lost.is_set() and not channel.is_closed:
                 # No new deliveries; the ones in flight still finish and acknowledge. Bounded, like the close below:
                 # a broker that stops answering mustn't hold a shutdown past service.STOP_TIMEOUT (see stop_bound).
-                with contextlib.suppress(aio_pika.exceptions.AMQPError, ConnectionError, TimeoutError):
+                # RuntimeError: the channel closed after the check (ChannelInvalidStateError); the drain must still run.
+                with contextlib.suppress(aio_pika.exceptions.AMQPError, ConnectionError, TimeoutError, RuntimeError):
                     async with asyncio.timeout(self.publish_timeout):
                         await queue.cancel(tag)
             await self._drain()
