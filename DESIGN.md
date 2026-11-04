@@ -205,6 +205,46 @@ So whichever of charge and refund arrives first (retries and dead-letter replays
 up not charged for a cancelled order. Calls to the provider carry the order id as an idempotency key, so a charge
 retried after a timeout cannot charge twice.
 
+The hardest path, as built: the provider is slower than the order's deadline, so the cancellation and its refund
+overtake the charge. Every arrow out of a service is an outbox row published by its relay; every arrow in is a
+delivery to an idempotent consumer.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant O as Order service
+    participant Q as RabbitMQ
+    participant P as Payment service
+    participant F as Provider (fake)
+    participant N as Notification service
+    C->>O: POST /orders
+    O->>O: reserve stock, insert order (AWAITING_PAYMENT, deadline), outbox payment.charge
+    O-->>C: 201 AWAITING_PAYMENT
+    O->>Q: payment.charge
+    Q->>P: payment.charge
+    P->>P: lock order, no payment row: decide = charge
+    P->>F: charge(order id as key) ... slow
+    Note over O: the deadline passes
+    O->>O: sweeper: lock order, CANCELLED (payment_timeout), stock released, refund_requested
+    O->>Q: order.cancelled, payment.refund
+    Q->>N: order.cancelled
+    N->>N: e-mail "any charge will be refunded"
+    Q->>P: payment.refund (waits for the order's lock)
+    F-->>P: approved
+    P->>P: payments row CHARGED, outbox payment.succeeded, commit (lock released)
+    P->>P: refund: row CHARGED, decide = refund
+    P->>F: refund(order id)
+    P->>P: row REFUNDED, outbox payment.refunded
+    P->>Q: payment.succeeded, payment.refunded
+    Q->>O: payment.succeeded: CANCELLED with a refund asked, ignored
+    Q->>O: payment.refunded: refund confirmed, ignored
+```
+
+The charge holds the order's lock through its provider call, so the refund waits for it. If the refund is handled
+first instead (the charge still waiting in a retry queue, say), it voids the order at the provider and the charge is
+then answered `failed (voided)` without reaching the provider; either way the provider ends with nothing taken
+(`test_a_payment_slower_than_the_deadline_is_cancelled_and_refunded`).
+
 **As built (day 3)**:
 
 - `orderly.saga.transition(state, event)` is the order's rules as a pure, total function: 4 states (awaiting,
