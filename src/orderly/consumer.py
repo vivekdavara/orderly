@@ -250,6 +250,7 @@ class Consumer:
     ) -> None:
         what = "a delivery" if message is None else f"{message.type} {message.message_id}"
         log.error("consumer %s: dead-lettering %s: %s", self.name, what, reason)
-        self.stats["dead_lettered"] += 1
-        # Rejected without requeue: the queue's dead-letter exchange takes it to <queue>.dlq, at least once.
+        # Rejected without requeue: the queue's dead-letter exchange takes it to <queue>.dlq, at least once. Counted
+        # after the reject (the broker then routes it on its own time: a test reading the dead-letter queue waits).
         await incoming.reject(requeue=False)
+        self.stats["dead_lettered"] += 1

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 
 import httpx
 import psycopg
+from aio_pika.abc import AbstractChannel, AbstractIncomingMessage
 from fastapi import FastAPI
 
 
@@ -41,3 +44,26 @@ def count(url: str, table: str) -> int:
         row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()
     assert row is not None
     return int(row[0])
+
+
+async def take(
+    channel: AbstractChannel,
+    queue: str,
+    expected: int,
+    timeout: float = 10.0,  # noqa: ASYNC109
+) -> list[AbstractIncomingMessage]:
+    """Take `expected` messages from a queue (acknowledged), waiting for them: a rejected message reaches its
+    dead-letter queue on the broker's own time, after the reject. Then checks that no more are there."""
+    source = await channel.get_queue(queue, ensure=False)
+    taken: list[AbstractIncomingMessage] = []
+    deadline = time.monotonic() + timeout
+    while len(taken) < expected:
+        incoming = await source.get(fail=False, no_ack=True)
+        if incoming is None:
+            assert time.monotonic() < deadline, f"{len(taken)} of {expected} on {queue} after {timeout} s"
+            await asyncio.sleep(0.01)
+            continue
+        taken.append(incoming)
+    await asyncio.sleep(0.1)
+    assert await source.get(fail=False, no_ack=True) is None, f"more on {queue} than {expected}"
+    return taken

@@ -12,7 +12,7 @@ import httpx
 import pytest
 from aio_pika.abc import AbstractChannel, AbstractConnection
 from fastapi import FastAPI
-from helpers import count, running
+from helpers import count, running, take
 
 from orderly import notifications
 from orderly.broker import amqp_url, publish
@@ -135,7 +135,6 @@ async def test_a_mailer_down_for_good_dead_letters_the_event(service: Notificati
     event = await service.send(confirmed())
     await service.until("dead_lettered", 1)
     assert service.mailer.attempts[event.payload.order_id] == 3  # the first try and two retries
-    dlq = await service.channel.get_queue(service.topology.dead_letter_queue("notification.order-events"), ensure=False)
-    dead = await dlq.get(fail=False, no_ack=True)
-    assert dead is not None and decode(dead.body).message_id == event.message_id
+    [dead] = await take(service.channel, service.topology.dead_letter_queue("notification.order-events"), 1)
+    assert decode(dead.body).message_id == event.message_id
     assert count(service.url, "notifications") == 0

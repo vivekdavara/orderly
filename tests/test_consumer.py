@@ -14,6 +14,7 @@ import aio_pika
 import psycopg
 import pytest
 from aio_pika.abc import AbstractChannel, AbstractConnection
+from helpers import take
 from psycopg_pool import AsyncConnectionPool
 
 from orderly.broker import publish
@@ -209,7 +210,7 @@ async def test_an_undecodable_message_is_dead_lettered_at_once(
     await exchange.publish(aio_pika.Message(b'{"not": "a message"}'), routing_key="payment.charge", mandatory=True)
     await run.until(lambda: run.consumer.stats["dead_lettered"] == 1)
     assert toy.calls == Counter()
-    dead = await queue_depth(channel, short_topology.dead_letter_queue("payment.commands"))
+    dead = await take(channel, short_topology.dead_letter_queue("payment.commands"), 1)
     assert [incoming.body for incoming in dead] == [b'{"not": "a message"}']
 
 
@@ -224,7 +225,7 @@ async def test_a_type_the_consumer_does_not_handle_is_dead_lettered(
     await publish(channel, short_topology, refund)  # routed to payment.commands, but this consumer takes only charges
     await run.until(lambda: run.consumer.stats["dead_lettered"] == 1)
     assert toy.calls == Counter()
-    assert len(await queue_depth(channel, short_topology.dead_letter_queue("payment.commands"))) == 1
+    assert len(await take(channel, short_topology.dead_letter_queue("payment.commands"), 1)) == 1
 
 
 async def test_a_failing_handler_is_retried_after_each_delay_and_its_effects_kept_once(
@@ -254,7 +255,7 @@ async def test_a_handler_that_keeps_failing_is_dead_lettered_after_the_last_dela
     assert toy.calls[message.message_id] == len(DELAYS) + 1
     assert run.consumer.stats["retried"] == len(DELAYS)
     assert effects(fresh_database) == []
-    dead = await queue_depth(channel, short_topology.dead_letter_queue("payment.commands"))
+    dead = await take(channel, short_topology.dead_letter_queue("payment.commands"), 1)
     assert [incoming.message_id for incoming in dead] == [str(message.message_id)]
     assert attempt_of(dead[0]) == len(DELAYS) + 1
     # Its id was never recorded, so a replay from the dead-letter queue is handled.

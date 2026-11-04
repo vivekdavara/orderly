@@ -14,7 +14,7 @@ import psycopg
 import pytest
 from aio_pika.abc import AbstractChannel, AbstractConnection
 from fastapi import FastAPI
-from helpers import running
+from helpers import running, take
 
 from orderly import payments
 from orderly.broker import amqp_url, publish
@@ -251,7 +251,6 @@ async def test_a_command_contradicting_the_payment_is_dead_lettered(service: Pay
     while service.consumer.stats["dead_lettered"] < 1:
         assert time.monotonic() < deadline
         await asyncio.sleep(0.01)
-    dlq = await service.channel.get_queue(service.topology.dead_letter_queue("payment.commands"), ensure=False)
-    dead = await dlq.get(fail=False, no_ack=True)
-    assert dead is not None and decode(dead.body).payload.TYPE == "payment.refund"
+    [dead] = await take(service.channel, service.topology.dead_letter_queue("payment.commands"), 1)
+    assert decode(dead.body).payload.TYPE == "payment.refund"
     assert service.provider.net_cents() == 2599  # nothing moved on the contradiction
