@@ -198,3 +198,26 @@ async def test_refund_errors_are_keyed_by_attempt_and_refund_nothing() -> None:
         attempt += 1
     await provider.refund(order, 100, "USD")
     assert provider.net_cents(order) == 0
+
+
+async def test_a_void_closes_the_key_and_refunds_a_charge_already_taken() -> None:
+    provider = FakeProvider()
+    assert await provider.void(ORDERS[1], 2599, "USD") is None
+    with pytest.raises(ProviderConflict, match="voided"):
+        await provider.charge(ORDERS[1], "c-1", 2599, "USD")  # a charge still in flight when the order gave up
+    assert provider.charges == {} and provider.net_cents() == 0
+    # A charge taken before the void (its reply lost in a crash) is refunded by it.
+    charge = await provider.charge(ORDERS[2], "c-1", 2599, "USD")
+    settled = await provider.void(ORDERS[2], 2599, "USD")
+    assert settled is not None and settled[0] == charge and settled[1].amount_cents == 2599
+    assert await provider.void(ORDERS[2], 2599, "USD") == settled  # idempotent
+    assert await provider.charge(ORDERS[2], "c-1", 2599, "USD") == charge  # the key's first answer, still refunded
+    assert provider.net_cents(ORDERS[2]) == 0
+
+
+async def test_a_void_of_another_amount_than_the_charge_is_refused() -> None:
+    provider = FakeProvider()
+    await provider.charge(ORDERS[3], "c-1", 2599, "USD")
+    with pytest.raises(ProviderConflict, match="asked to void 100 USD"):
+        await provider.void(ORDERS[3], 100, "USD")
+    assert ORDERS[3] not in provider.voided and provider.net_cents() == 2599
