@@ -8,10 +8,12 @@ the monolith.
 
 Python 3.11, FastAPI, RabbitMQ 4.3 (aio-pika), PostgreSQL 14 (psycopg 3), pytest. MIT licensed.
 
-**Status: day 2 of 5.** Day 1: the design, the message contracts, the RabbitMQ topology, the database schemas and
+**Status: day 3 of 5.** Day 1: the design, the message contracts, the RabbitMQ topology, the database schemas and
 their migrations, the local RabbitMQ and PostgreSQL scripts, CI. Day 2: the monolith baseline, the order service
-extracted from it, and the transactional outbox with its relay, so an order's `payment.charge` reaches the payment
-service's queue. The payment and notification services and the saga come on day 3 ([DESIGN.md](DESIGN.md) "Days").
+extracted from it, and the transactional outbox with its relay. Day 3: the payment and notification services, the saga
+with its compensations (stock released, refunds, a deadline), idempotent consumers, retries through wait queues with
+backoff, and dead letters; an order now goes from `POST /orders` to its e-mail through all three services. Day 4 adds
+contract tests, failure injection and the 10,000-order load test ([DESIGN.md](DESIGN.md) "Days").
 
 ## Architecture
 
@@ -44,14 +46,19 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 |---|---|
 | `src/orderly/monolith.py` | The baseline (day 2): the whole order in one request and one transaction, the provider and the mailer called inside it |
 | `src/orderly/ordering.py` | Taking an order, shared by the monolith and the order service: request validation, Idempotency-Key replay, stock reserved in sku order |
-| `src/orderly/orders.py` | The order service (day 2): the order and its `payment.charge` written in one transaction; the outbox relay as its worker |
+| `src/orderly/orders.py` | The order service: the order and its `payment.charge` written in one transaction (day 2); the saga's reply consumer and deadline sweeper, each applying `saga.transition` to the locked order (day 3); the outbox relay |
+| `src/orderly/saga.py` | The order's saga as a pure, total transition function: 4 states by 6 inputs, every pair tested (day 3) |
+| `src/orderly/payment_rules.py` | The payment table as pure functions: what a charge or refund does to an order's payment row, and the reply (day 3) |
+| `src/orderly/payments.py` | The payment service (day 3): payment.commands applied one order at a time (advisory lock), the provider called in the transaction, a refund before any charge voiding at the provider; replies through its outbox |
+| `src/orderly/notifications.py` | The notification service (day 3): one e-mail per order and kind, retried, at least once |
+| `src/orderly/consumer.py` | The idempotent consumer every service uses (day 3): `processed_messages` in the handler's transaction, retries through the wait queues, dead letters, a stop that drains, resubscribing after a broker drop |
 | `src/orderly/outbox.py` | The transactional outbox: `write` in the change's transaction, `Relay` claiming in id order with `SKIP LOCKED`, publishing a batch, confirming, marking; LISTEN/NOTIFY wake-up |
 | `src/orderly/order_api.py` | `POST /orders` and `GET /orders/{id}`, the same for both apps |
-| `src/orderly/fakes.py`, `src/orderly/emails.py` | The deterministic fake payment provider and mailer; the two e-mails |
+| `src/orderly/fakes.py`, `src/orderly/emails.py` | The deterministic fake payment provider (idempotent charges, refunds and voids by order id) and mailer; the two e-mails |
 | `src/orderly/seed.py` | A synthetic catalogue: `python -m orderly.seed orders` |
 | `src/orderly/messages.py` | The contract: a JSON envelope around seven typed payloads; `decode` is strict and says why it refuses, `encode` is canonical |
 | `docs/message-schema.json` | The same contract as a JSON Schema, generated from the code (`scripts/export_message_schema.py`) and checked by tests |
-| `src/orderly/topology.py` | Exchanges, quorum queues, dead-letter queues and bindings as code; `routes()` says where each type goes |
+| `src/orderly/topology.py` | Exchanges, quorum queues, dead-letter queues, the retry wait queues (1 s, 5 s, 30 s) and bindings as code; `routes()` says where each type goes |
 | `src/orderly/broker.py` | Persistent, mandatory, confirmed publishing on a channel where a returned message is an error |
 | `src/orderly/service.py` | The skeleton every service shares: migrate and declare at startup, `/health` (200 only with its database, schema, broker and workers right), routes and background workers stopped by an event, every connection READ COMMITTED; ports 8112-8114 (the monolith takes 8112) |
 | `src/orderly/migrate.py`, `src/orderly/migrations/` | Numbered SQL migrations per service, applied in one transaction under an advisory lock; edited history refused |
@@ -59,7 +66,7 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `scripts/postgres.sh` | Creates, migrates, lists and drops Orderly's databases on the local PostgreSQL 14 (`ORDERLY_PG_PREFIX` renames them) |
 | `scripts/measure_test_fixture.py` | Times CREATE DATABASE against CREATE SCHEMA (why each test gets a schema) |
 | `scripts/measure_relay.py`, `scripts/measure_intake.py` | The relay's throughput by batch size; order intake, monolith against order service, on one hot product |
-| `tests/` | 375 tests: unit, property and integration tests against the real servers |
+| `tests/` | 516 tests: unit, property and integration tests against the real servers, whole sagas through the three services |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
 ## Run it
@@ -73,20 +80,28 @@ make check             # ruff, ruff format --check, mypy --strict, pytest
 make services-down     # stop the RabbitMQ node (the databases stay)
 ```
 
-Run the order service (it migrates its database and declares the topology first) with a synthetic catalogue, and
-place an order:
+Run the three services (each migrates its database and declares the topology first) with a synthetic catalogue, and
+follow an order through them:
 
 ```bash
 .venv/bin/python -m orderly.seed orders                # SKU-0001..SKU-0100, 10,000 units each
-.venv/bin/python -m orderly.service orders             # 127.0.0.1:8112; payments 8113, notifications 8114
-curl -s http://127.0.0.1:8112/health                   # {"service":"orders","schema_expected":1,"schema":1,"status":"ok","problems":{}}
+ORDERLY_PROVIDER_LATENCY_MS=50 .venv/bin/python -m orderly.service payments &     # 127.0.0.1:8113
+.venv/bin/python -m orderly.service notifications &    # 127.0.0.1:8114
+.venv/bin/python -m orderly.service orders             # 127.0.0.1:8112
+curl -s http://127.0.0.1:8112/health                   # {"service":"orders","schema_expected":2,"schema":2,"outbox":{...},"status":"ok","problems":{}}
 curl -s -H 'content-type: application/json' -H 'Idempotency-Key: try-1' http://127.0.0.1:8112/orders \
   -d '{"customer_id":"c-1","email":"ada@example.com","lines":[{"sku":"SKU-0001","quantity":2}]}'
+curl -s http://127.0.0.1:8112/orders/<id>              # CONFIRMED a moment later
+curl -s http://127.0.0.1:8113/payments/<id>            # CHARGED, with the provider's reference
+curl -s http://127.0.0.1:8114/notifications/<id>       # the confirmation e-mail
 ```
 
-The answer is `201` with the order `AWAITING_PAYMENT`; its `payment.charge` is on the `payment.commands` queue (nothing
-consumes it until day 3). The same request again replays the order (`Idempotent-Replayed: true`). Or run the monolith
-instead, on the same port, where the order is charged and confirmed inside the request:
+The answer to the POST is `201` with the order `AWAITING_PAYMENT`; the same request again replays it
+(`Idempotent-Replayed: true`). `ORDERLY_PROVIDER_DECLINE_RATIO=0.3` on the payment service declines some orders (they
+end `CANCELLED`, stock back). An order whose payment doesn't answer by `ORDERLY_PAYMENT_TIMEOUT_S` (30 s) is cancelled
+by the sweeper (it looks every second) and refunded; `tests/test_sagas_end_to_end.py` runs that with a provider slower
+than the deadline. Or run the monolith instead, on 8112, where the order is charged and
+confirmed inside the request:
 
 ```bash
 .venv/bin/python -m orderly.seed monolith
@@ -95,7 +110,8 @@ ORDERLY_PROVIDER_LATENCY_MS=50 ORDERLY_PROVIDER_DECLINE_RATIO=0.1 .venv/bin/pyth
 
 Settings: `ORDERLY_<SERVICE>_DATABASE_URL`, `ORDERLY_AMQP_URL`, `ORDERLY_POOL_SIZE` (10), `ORDERLY_POOL_TIMEOUT_S`
 (5), `ORDERLY_PAYMENT_TIMEOUT_S` (30, the order service's payment deadline), and the fake provider's
-`ORDERLY_PROVIDER_LATENCY_MS`, `ORDERLY_PROVIDER_DECLINE_RATIO`, `ORDERLY_PROVIDER_ERROR_RATIO` (0).
+`ORDERLY_PROVIDER_LATENCY_MS`, `ORDERLY_PROVIDER_DECLINE_RATIO`, `ORDERLY_PROVIDER_ERROR_RATIO` (0), and the fake
+mailer's `ORDERLY_MAILER_LATENCY_MS`, `ORDERLY_MAILER_FAILURE_RATIO` (0).
 
 The scripts on their own:
 
@@ -111,7 +127,44 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 375 tests in about 75 s here (`/usr/bin/time -p make check` at `2c715ec`, 366 tests: 74.6 s real at 16:18, load average 2.4; 30.7 s for day 1's 231). Day 2's:
+`make check` runs 516 tests in about 2 minutes here (120.5 s for the pytest part of a run at 15:50 on day 3, 516
+tests; 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 3's (141 new):
+
+- **The saga's rules** (54, `tests/test_saga.py`): the full table of 24 (state, input) pairs, each with its outcome,
+  status and effects, and which are anomalies; only a step out of awaiting payment changes the status or releases
+  stock; Hypothesis runs of random reply sequences (duplicates, reorderings): stock released, outcome announced and
+  refund asked at most once, a cancelled order after any success always refunded, a confirmed one never, a repeated
+  input changing nothing.
+- **The payment rules** (27, `tests/test_payment_rules.py`): the table for every row and command, contradictions
+  refused, and Hypothesis sequences of charges and refunds in any order: a refunded order ends with nothing charged,
+  money never negative nor above one charge, a repeated command answered alike.
+- **The consumer** (14, `tests/test_consumer.py`, real servers, 0.2/0.4 s delays): handled once; a duplicate skipped;
+  eight concurrent copies handled once; concurrency up to the prefetch; undecodable and foreign types dead-lettered;
+  two failures then success with each delay between attempts and one effect; failing for good dead-lettered after the
+  last delay with nothing kept and the id unrecorded (so a replay is handled); `Refused`; the handler timeout; a stop
+  mid-handler that still commits and acknowledges; aiormq's bare `Exception()` survived.
+- **The payment service** (9): approved and declined charges; a redelivery deduplicated and a repeated command
+  answered with the same payment; a refund after the charge; a refund first, and the charge never taken; a charge whose
+  transaction was lost refunded by the void; 20 orders with charge and refund delivered together ending with nothing
+  charged (fails without the per-order lock); a provider outage retried; a contradiction dead-lettered.
+- **The order service's saga** (8): a success confirms and announces; a decline cancels and returns the stock; the
+  deadline cancels, returns the stock and asks for a refund; a success after the deadline covered by that refund; a
+  success after a decline refunded once; ruled-out replies changing nothing; an unknown order dead-lettered; 30
+  successes racing their deadlines ending confirmed without a refund or cancelled with one, stock matching. And the
+  day-2 broker-drop test now sends a reply after the drop and sees it consumed.
+- **The notification service** (6): a confirmation (in JPY, minor units), a cancellation's text for each reason, one
+  e-mail for a redelivery and for the same fact under a second id, a mailer outage retried, a mailer down for good
+  dead-lettering the event.
+- **End to end** (5, `tests/test_sagas_end_to_end.py`, the three services in one process): approved, declined, a
+  provider slower than the deadline (cancelled, refunded, nothing charged), 60 orders with a quarter declined and the
+  provider's first two calls failing for about 30% of them (every order settles, one e-mail each, the provider's net
+  equals the confirmed totals, stock matches), and a charge failing all four attempts (dead-lettered, timed out,
+  voided).
+- **The retry topology** (12 in `tests/test_topology.py`): names, arguments, labels and validation; a message coming
+  back to each work queue after each delay with its body and attempt header; the TTL fixed at declaration. **Fakes**
+  (5): refunds and voids, idempotent, only of an approved charge of that amount.
+
+Day 2's:
 
 - **The monolith** (23, `tests/test_monolith.py`): confirmed (stock, payment, notification, e-mail), declined (402, stock back),
   refused orders writing and charging nothing (out of stock, unknown sku, mixed currencies, a total over the limit),
@@ -183,6 +236,19 @@ Tests that need a server find it at `ORDERLY_AMQP_URL` and `ORDERLY_TEST_DATABAS
 are skipped when it isn't there, except with `ORDERLY_REQUIRE_SERVICES=1` (CI sets it), where a missing server fails
 them. Each test isolates itself on the shared servers: a random prefix on every exchange and queue it declares, and a
 private schema in the test database.
+
+## Results (day 3)
+
+Day 3 is about correctness; its numbers are the tests above and these runs (Apple M3, macOS 26.6.2, on AC, PostgreSQL
+14.20, RabbitMQ 4.3.6, synthetic data). The throughput and latency of whole sagas are day 4's load test.
+
+- **The three services as separate processes** (`python -m orderly.service orders|payments|notifications`, provider at
+  50 ms, 15:56): `/health` 200 on each; an order of 2 × SKU-0001 + 1 × SKU-0002 was `AWAITING_PAYMENT` (22,075 cents)
+  at once and `CONFIRMED` when read 1.5 s later (not a latency measurement), its payment `CHARGED`, its confirmation recorded; a day-2 smoke order still
+  awaiting payment (its charge had been consumed by hand that day) was cancelled by the sweeper (`payment_timeout`),
+  its refund voided it at the provider (`VOIDED`); clean SIGINT exits.
+- **The retry wait queues**: one probe saw a message in a 0.3 s wait queue back in its work queue after 0.31 s.
+- `make check`: 516 tests, the pytest part 120.5 s (one run at 15:50).
 
 ## Results (day 2)
 
@@ -317,11 +383,27 @@ connection and with the lock already held, `-1` really meaning no limit, cleanup
 - **A `CancelledError` the task didn't ask for is a broker error**: aiormq raises one into an RPC's caller when the
   connection closes; only `Task.cancelling()` says the task itself is being cancelled.
 - **A pool timeout is a 503 with Retry-After**, not a 500.
+- **The saga's rules and the payment table are pure functions** (`saga.py`, `payment_rules.py`), applied by thin
+  database code: the tests enumerate every pair and run random sequences without a server.
+- **A refund before any recorded charge voids at the provider**: a charge whose transaction never committed may have
+  taken the money, so recording a void locally isn't enough (day 3).
+- **One payment command at a time per order** (a transaction-level advisory lock), and the provider called inside the
+  transaction: no intermediate state to recover, because the provider's calls are idempotent by order id.
+- **Retries through wait queues, never requeues**: RabbitMQ 4 doesn't count a requeue toward the delivery limit, so a
+  requeue on a persistent error loops forever; a wait queue per delay gives backoff without a plugin.
+- **The consumer owns its recovery**: on any close of its channel it closes it for good and subscribes again, rather
+  than trusting aio-pika's robust channel to restore a subscription it doesn't know about.
 
 ## Limitations
 
-- Nothing consumes `payment.commands` yet: the payment and notification services, the saga's reply handling and the
-  deadline sweeper are day 3. An order stays AWAITING_PAYMENT.
+- A dead-lettered message waits for an operator: there is no replay tool yet, and a dead-lettered `payment.refund`
+  (the provider failing all four attempts) leaves a cancelled order's customer charged until someone replays it. The
+  dead-letter queues have no alert either.
+- The confirmation e-mail is at least once: a crash between the send and the commit sends it again.
+- The payment service holds a database connection for each provider call in flight (8 at most per instance, the
+  consumer's prefetch), so a slow provider limits its throughput to 8 / latency per instance.
+- The sweeper looks every second, so an order is cancelled up to a second after its deadline.
+- Anomalies (replies the protocol rules out) are only logged, not counted or alerted on.
 - The monolith's flaws are deliberate (it is the baseline): a failure after the charge leaves the charge, and its retry
   charges again.
 - An outbox row that can never be published (a type no binding routes) is retried forever, its wait doubling from
@@ -338,7 +420,8 @@ connection and with the lock already held, `-1` really meaning no limit, cleanup
 - `last_error` is capped at 1,000 characters by a CHECK on `length()`, which counts characters in a UTF-8 database (all
   of Orderly's) but bytes in a SQL_ASCII one.
 - The relay doesn't promise a global order across orders (ids are taken before commit); nothing relies on one.
-- The fakes keep their state in memory: restarting the monolith forgets its provider's charges.
+- The fakes keep their state in memory: restarting the monolith or the payment service forgets its provider's charges
+  (the payment rows stay).
 - The RabbitMQ script tests run only where RabbitMQ is installed; CI uses a service container and skips them.
 - One RabbitMQ node: quorum queues are replicated only on a cluster, which this project doesn't run.
 - The orders schema checks e-mails with PostgreSQL's `[:space:]`, the messages with their own spelled-out set; the API
