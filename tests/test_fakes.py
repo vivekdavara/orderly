@@ -159,3 +159,42 @@ def test_the_two_emails() -> None:
 )
 def test_money_uses_the_currencys_minor_unit(amount: int, currency: str, text: str) -> None:
     assert emails.money(amount, currency) == text
+
+
+async def test_a_refund_gives_back_an_approved_charge_once() -> None:
+    provider = FakeProvider()
+    await provider.charge(ORDERS[1], "c-1", 2599, "USD")
+    refund = await provider.refund(ORDERS[1], 2599, "USD")
+    assert refund.reference == f"re_{ORDERS[1].hex[:24]}"
+    assert await provider.refund(ORDERS[1], 2599, "USD") == refund  # idempotent by order id
+    assert provider.charged_cents() == 2599 and provider.net_cents() == 0 and provider.net_cents(ORDERS[1]) == 0
+    assert provider.refund_attempts[ORDERS[1]] == 2
+
+
+async def test_a_refund_needs_an_approved_charge_of_that_amount() -> None:
+    provider = FakeProvider(declined_customers=frozenset({"c-declined"}))
+    with pytest.raises(ProviderConflict, match="no approved charge"):
+        await provider.refund(ORDERS[1], 2599, "USD")
+    await provider.charge(ORDERS[2], "c-declined", 2599, "USD")
+    with pytest.raises(ProviderConflict, match="no approved charge"):
+        await provider.refund(ORDERS[2], 2599, "USD")
+    await provider.charge(ORDERS[3], "c-1", 2599, "USD")
+    with pytest.raises(ProviderConflict, match="asked to refund 2600 USD"):
+        await provider.refund(ORDERS[3], 2600, "USD")
+    assert provider.refunds == {} and provider.net_cents() == 2599
+
+
+async def test_refund_errors_are_keyed_by_attempt_and_refund_nothing() -> None:
+    provider = FakeProvider(error_ratio=0.5)
+    order = next(o for o in ORDERS if fraction(o, "error:1") >= 0.5 and fraction(o, "refund-error:1") < 0.5)
+    await provider.charge(order, "c-1", 100, "USD")
+    with pytest.raises(ProviderUnavailable, match="refund"):
+        await provider.refund(order, 100, "USD")
+    assert provider.refunds == {}
+    attempt = provider.refund_attempts[order]
+    while fraction(order, f"refund-error:{attempt + 1}") < 0.5:
+        with pytest.raises(ProviderUnavailable):
+            await provider.refund(order, 100, "USD")
+        attempt += 1
+    await provider.refund(order, 100, "USD")
+    assert provider.net_cents(order) == 0

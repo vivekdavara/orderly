@@ -43,12 +43,22 @@ class Charge:
     reference: str | None
 
 
+@dataclass(frozen=True)
+class Refund:
+    order_id: uuid.UUID
+    amount_cents: int
+    currency: str
+    # The provider's id for the refund.
+    reference: str
+
+
 @dataclass
 class FakeProvider:
     """A payment provider: `latency` seconds per call, a share of orders declined and a share of calls failing.
 
     `declined_customers` are always declined (tests use it to pick an outcome without searching for an order id).
     Charges are idempotent by order id: charging an order again returns the first answer and charges nothing more.
+    Refunds are too: an order's charge is refunded whole, once, however often it is asked.
     """
 
     latency: float = 0.0
@@ -58,6 +68,8 @@ class FakeProvider:
     charges: dict[uuid.UUID, Charge] = field(default_factory=dict)
     # Calls per order, failed ones included: the attempt number that keys an error.
     attempts: Counter[uuid.UUID] = field(default_factory=Counter)
+    refunds: dict[uuid.UUID, Refund] = field(default_factory=dict)
+    refund_attempts: Counter[uuid.UUID] = field(default_factory=Counter)
 
     async def charge(self, order_id: uuid.UUID, customer_id: str, amount_cents: int, currency: str) -> Charge:
         await asyncio.sleep(self.latency)
@@ -83,9 +95,36 @@ class FakeProvider:
         self.charges[order_id] = charge
         return charge
 
+    async def refund(self, order_id: uuid.UUID, amount_cents: int, currency: str) -> Refund:
+        """Give back an order's approved charge, which must be for exactly this amount. Idempotent by order id."""
+        await asyncio.sleep(self.latency)
+        self.refund_attempts[order_id] += 1
+        if fraction(order_id, f"refund-error:{self.refund_attempts[order_id]}") < self.error_ratio:
+            raise ProviderUnavailable(f"refund for order {order_id} failed (attempt {self.refund_attempts[order_id]})")
+        charge = self.charges.get(order_id)
+        if charge is None or not charge.approved:
+            raise ProviderConflict(f"order {order_id} has no approved charge to refund")
+        if (charge.amount_cents, charge.currency) != (amount_cents, currency):
+            raise ProviderConflict(
+                f"order {order_id} was charged {charge.amount_cents} {charge.currency}, "
+                f"asked to refund {amount_cents} {currency}"
+            )
+        previous = self.refunds.get(order_id)
+        if previous is not None:
+            return previous
+        refund = Refund(order_id, amount_cents, currency, reference=f"re_{order_id.hex[:24]}")
+        self.refunds[order_id] = refund
+        return refund
+
     def charged_cents(self) -> int:
-        """What the provider has taken from customers in total: the approved charges."""
+        """What the provider has taken from customers in total: the approved charges, refunded or not."""
         return sum(charge.amount_cents for charge in self.charges.values() if charge.approved)
+
+    def net_cents(self, order_id: uuid.UUID | None = None) -> int:
+        """What customers are out of pocket, for one order or all: approved charges less their refunds."""
+        charges = [c for c in self.charges.values() if c.approved and order_id in (None, c.order_id)]
+        refunds = [r for r in self.refunds.values() if order_id in (None, r.order_id)]
+        return sum(c.amount_cents for c in charges) - sum(r.amount_cents for r in refunds)
 
 
 class MailerUnavailable(Exception):
