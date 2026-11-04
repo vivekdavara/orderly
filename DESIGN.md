@@ -225,7 +225,9 @@ retried after a timeout cannot charge twice.
   the customer charged for a cancelled order. So the void is a provider call (like cancelling a payment intent): it
   refunds a charge the provider already took (the row becomes `REFUNDED`, the reply carries the amount) and closes the
   order's key, so a charge request still in flight is refused. Found while writing the payment service; pinned by
-  `test_a_refund_finding_no_row_refunds_a_charge_whose_transaction_was_lost`.
+  `test_a_refund_finding_no_row_refunds_a_charge_whose_transaction_was_lost`. The other way round (the void reached the
+  provider, its transaction was lost, the charge comes next): the provider refuses the charge (`ProviderVoided`), and
+  the payment service records `VOIDED` and answers `failed (voided)`, as the table does (day-3 review).
 - **One command at a time per order.** The payment service takes a transaction-level advisory lock on the order
   (`pg_advisory_xact_lock(4113, hashtext(order_id))`) before reading its row, so a charge and a refund delivered at once
   (prefetch 8, or two instances) are applied one after the other, never both against "no payment yet".
@@ -410,7 +412,10 @@ outbox never does) can't send two e-mails.
   requeued, since RabbitMQ 4 doesn't count requeues toward the delivery limit. If the broker can't take the copy, the
   consumer closes its channel instead of acknowledging, so the delivery comes back counted toward the limit.
 - A stop cancels the subscription, waits for the handlers in flight (each bounded by its timeout), then closes the
-  channel.
+  channel; the cancel and the close are bounded too, so a stop takes at most `stop_bound` (5 + 16 + 5 = 26 s), inside
+  the services' 30 s `STOP_TIMEOUT`.
+- A `RuntimeError` from the subscription steps (aiormq's `ChannelInvalidStateError` for a channel the broker has
+  closed) is a broker failure: back off and subscribe again (day-3 review: it ended the consumer for good).
 - After any close of its channel (a broker drop included) the consumer closes the channel for good and subscribes on a
   new one. Watching `is_closed` alone wasn't enough: aio-pika's robust channel reopens itself after a reconnect and
   reports itself open again, without the subscription, and the consumer silently stopped consuming (found by the

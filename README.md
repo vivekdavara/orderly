@@ -66,7 +66,7 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `scripts/postgres.sh` | Creates, migrates, lists and drops Orderly's databases on the local PostgreSQL 14 (`ORDERLY_PG_PREFIX` renames them) |
 | `scripts/measure_test_fixture.py` | Times CREATE DATABASE against CREATE SCHEMA (why each test gets a schema) |
 | `scripts/measure_relay.py`, `scripts/measure_intake.py` | The relay's throughput by batch size; order intake, monolith against order service, on one hot product |
-| `tests/` | 516 tests: unit, property and integration tests against the real servers, whole sagas through the three services |
+| `tests/` | 522 tests: unit, property and integration tests against the real servers, whole sagas through the three services |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
 ## Run it
@@ -127,8 +127,8 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 516 tests in about 2 minutes here (120.5 s for the pytest part of a run at 15:50 on day 3, 516
-tests; 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 3's (141 new):
+`make check` runs 522 tests in about 2 minutes here (120.5 s for the pytest part of a run at 15:50 on day 3, 516
+tests; 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 3's (147 new):
 
 - **The saga's rules** (54, `tests/test_saga.py`): the full table of 24 (state, input) pairs, each with its outcome,
   status and effects, and which are anomalies; only a step out of awaiting payment changes the status or releases
@@ -138,19 +138,22 @@ tests; 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 3's (141 new):
 - **The payment rules** (27, `tests/test_payment_rules.py`): the table for every row and command, contradictions
   refused, and Hypothesis sequences of charges and refunds in any order: a refunded order ends with nothing charged,
   money never negative nor above one charge, a repeated command answered alike.
-- **The consumer** (14, `tests/test_consumer.py`, real servers, 0.2/0.4 s delays): handled once; a duplicate skipped;
+- **The consumer** (17, `tests/test_consumer.py`, real servers, 0.2/0.4 s delays): handled once; a duplicate skipped;
   eight concurrent copies handled once; concurrency up to the prefetch; undecodable and foreign types dead-lettered;
   two failures then success with each delay between attempts and one effect; failing for good dead-lettered after the
   last delay with nothing kept and the id unrecorded (so a replay is handled); `Refused`; the handler timeout; a stop
-  mid-handler that still commits and acknowledges; aiormq's bare `Exception()` survived.
-- **The payment service** (9): approved and declined charges; a redelivery deduplicated and a repeated command
+  mid-handler that still commits and acknowledges; aiormq's bare `Exception()` survived; the stop's bound against the
+  services' stop timeout, a broker that never answers the cancel, a cancel on a channel closed under it still draining.
+- **The payment service** (10): approved and declined charges; a redelivery deduplicated and a repeated command
   answered with the same payment; a refund after the charge; a refund first, and the charge never taken; a charge whose
   transaction was lost refunded by the void; 20 orders with charge and refund delivered together ending with nothing
-  charged (fails without the per-order lock); a provider outage retried; a contradiction dead-lettered.
-- **The order service's saga** (8): a success confirms and announces; a decline cancels and returns the stock; the
+  charged (fails without the per-order lock); a provider outage retried; a contradiction dead-lettered; a charge after
+  a lost void answered "voided" (10 in all).
+- **The order service's saga** (9): a success confirms and announces; a decline cancels and returns the stock; the
   deadline cancels, returns the stock and asks for a refund; a success after the deadline covered by that refund; a
   success after a decline refunded once; ruled-out replies changing nothing; an unknown order dead-lettered; 30
-  successes racing their deadlines ending confirmed without a refund or cancelled with one, stock matching. And the
+  successes racing their deadlines ending confirmed without a refund or cancelled with one, stock matching; an order
+  locked by a reply not holding up the sweeper (9 in all). And the
   day-2 broker-drop test now sends a reply after the drop and sees it consumed.
 - **The notification service** (6): a confirmation (in JPY, minor units), a cancellation's text for each reason, one
   e-mail for a redelivery and for the same fact under a second id, a mailer outage retried, a mailer down for good
@@ -162,7 +165,8 @@ tests; 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 3's (141 new):
   voided).
 - **The retry topology** (12 in `tests/test_topology.py`): names, arguments, labels and validation; a message coming
   back to each work queue after each delay with its body and attempt header; the TTL fixed at declaration. **Fakes**
-  (5): refunds and voids, idempotent, only of an approved charge of that amount.
+  (5): refunds and voids, idempotent, only of an approved charge of that amount. **The review's** (1,
+  `tests/review_d3/`): failed 3 of 3 on the code it was written against, passes now.
 
 Day 2's:
 
@@ -296,6 +300,26 @@ The second row is the day's most useful finding: on RabbitMQ 4, requeueing a mes
 so a consumer that requeues on a transient error would loop forever without the delivery limit ever stopping it. The
 retries (day 3) therefore never requeue: they go through wait queues with their own attempt count.
 
+## Review of day 3
+
+One review agent, in its own git worktree, read the day's code at `52f28ef` (15:56-16:10, about 14 minutes) with a
+correctness brief, wrote each finding as a failing test and mutated 11 load-bearing lines. One defect, fixed, its test
+failing 3 of 3 before and passing 3 of 3 after:
+
+| Defect | Fix |
+|---|---|
+| aiormq raises `ChannelInvalidStateError` (a `RuntimeError`, not an `AMQPError`) for `set_qos`, `get_queue` or `consume` on a channel the broker has closed; `Consumer.run` didn't back off on it, so a channel closed between the open and the subscription ended the consumer for good (the order service would stop taking replies, the payment service stop charging) | a `RuntimeError` from the subscription steps is a `ConnectionError`: back off, subscribe again; the stop's cancel suppresses it too (`ec6abea`, `tests/review_d3/`) |
+
+Of its suspicions, one was real and is fixed: a charge arriving after a refund's void had reached the provider (with
+the void's transaction lost) was dead-lettered as a conflict instead of answered "failed (voided)" as the table says
+(`54811f6`). Its one surviving mutant (`FOR UPDATE` without `SKIP LOCKED` in the sweeper: correct, since `lock_order`
+re-reads the row, but the sweeper would wait behind a reply) has a test now that fails on it (`36be0f3`). Not acted
+on: a message replayed from a dead-letter queue keeps its attempt count (a replay tool must reset it: Limitations);
+duplicate retry chains if a handler outlived the drain, which the bounds rule out (a handler is cut off at 10 s, its
+retry publish at 5 s, the drain waits 16 s). What held: the transition function and payment rules against DESIGN's
+tables; no lock-order cycle among the advisory lock, `processed_messages`, the order rows and the products; stock
+released exactly once; 30 random connection drops (4 seeds) with the consumer always consuming again afterwards.
+
 ## Review of day 2
 
 One review agent, in its own git worktree, read the day's code at `00ebdc4` (15:28-15:43) with a correctness brief and
@@ -398,7 +422,8 @@ connection and with the lock already held, `-1` really meaning no limit, cleanup
 
 - A dead-lettered message waits for an operator: there is no replay tool yet, and a dead-lettered `payment.refund`
   (the provider failing all four attempts) leaves a cancelled order's customer charged until someone replays it. The
-  dead-letter queues have no alert either.
+  dead-letter queues have no alert either. A replay must reset `x-orderly-attempt` (a dead letter carries 4), or the
+  replayed message's first failure dead-letters it again.
 - The confirmation e-mail is at least once: a crash between the send and the commit sends it again.
 - The payment service holds a database connection for each provider call in flight (8 at most per instance, the
   consumer's prefetch), so a slow provider limits its throughput to 8 / latency per instance.

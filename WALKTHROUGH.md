@@ -395,6 +395,26 @@ The record is: `unique (order_id, kind)` and `processed_messages` mean one row p
 least once: it's sent with the transaction open, so a crash after the send and before the commit sends it again on the
 redelivery. Exactly-once delivery to a mailbox would need the mailer to deduplicate on a key we give it.
 
+## The review (day 3)
+
+**What did the review find?**
+One agent, in its own worktree, with a correctness brief and findings as failing tests (`tests/review_d3/`). One
+defect: aiormq raises `ChannelInvalidStateError`, a `RuntimeError`, for a call on a channel the broker has closed, and
+the consumer only backed off on AMQP and connection errors, so a channel closed between the open and the subscription
+killed the consumer for good. A `RuntimeError` from those steps is now a broker failure. One of its suspicions was real
+too: after a void reached the provider and its transaction was lost, the next charge was dead-lettered as a conflict
+instead of answered "failed (voided)"; `ProviderVoided` now tells the payment service what happened.
+
+**And the mutants?**
+It changed 11 load-bearing lines (the advisory lock, `FOR UPDATE` in `lock_order`, the duplicate check, the attempt
+bound, the attempt header, the close-callback watch, the late-success and `refund_requested` rules, the provider's key
+closing, the drain). Ten failed a test; the survivor was `SKIP LOCKED` in the sweeper, which is correct without it but
+makes the sweeper wait behind a reply's lock, so there's a test for that now.
+
+**What did it not find?**
+No lock-order cycle, stock released exactly once, the rules matching DESIGN's tables, and the consumer consuming again
+after 30 random connection drops.
+
 ## What went wrong on day 3
 
 - The first end-to-end test of 60 orders used the fake provider's per-attempt error coin at 30%: about 1 order in 125
