@@ -198,7 +198,7 @@ class Relay:
                 except RelayError as error:
                     if error.broker:  # the broker's failure: back off as for an outage (below)
                         log.warning("outbox relay: %s; retrying in %.1f s", error, backoff)
-                        await _wait(stop, timeout=backoff)
+                        await wait_any(stop, timeout=backoff)
                         backoff = min(backoff * 2, MAX_BACKOFF)
                         continue
                     # Only rows that failed on their own, and wait for their own retries: nothing is wrong with the
@@ -221,12 +221,12 @@ class Relay:
                     if isinstance(error, asyncio.CancelledError) and current is not None and current.cancelling():
                         raise
                     log.warning("outbox relay: %r; retrying in %.1f s", error, backoff)
-                    await _wait(stop, timeout=backoff)
+                    await wait_any(stop, timeout=backoff)
                     backoff = min(backoff * 2, MAX_BACKOFF)
                     continue
                 backoff = MIN_BACKOFF
                 if claimed < self.batch_size:  # a full batch probably means more are waiting
-                    await _wait(stop, wake, timeout=self.poll_interval)
+                    await wait_any(stop, wake, timeout=self.poll_interval)
         finally:
             if listener is not None:
                 listener.cancel()
@@ -251,10 +251,10 @@ class Relay:
             except psycopg.Error as error:
                 self.listener_pid = None
                 log.warning("outbox relay: listener lost (%s); polling until it reconnects", error)
-                await _wait(stop, timeout=1.0)
+                await wait_any(stop, timeout=1.0)
 
 
-async def _wait(*events: asyncio.Event, timeout: float) -> None:  # noqa: ASYNC109 (the timeout is the point)
+async def wait_any(*events: asyncio.Event, timeout: float) -> None:  # noqa: ASYNC109 (the timeout is the point)
     """Until any of the events is set, or the timeout."""
     waiters = [asyncio.create_task(event.wait()) for event in events]
     try:
