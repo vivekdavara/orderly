@@ -107,10 +107,14 @@ async def short_topology(connection: AbstractConnection) -> AsyncIterator[Topolo
 
 
 async def start(
-    fresh_database: str, topology: Topology, channel: AbstractChannel, payment_timeout: float
+    fresh_database: str,
+    topology: Topology,
+    channel: AbstractChannel,
+    payment_timeout: float,
+    sweep_interval: float = 0.05,
 ) -> AsyncIterator[Saga]:
     settings = Settings("orders", fresh_database, amqp_url(), topology)
-    app = orders.create_app(settings, payment_timeout=payment_timeout, poll_interval=0.2, sweep_interval=0.05)
+    app = orders.create_app(settings, payment_timeout=payment_timeout, poll_interval=0.2, sweep_interval=sweep_interval)
     async with running(app) as client:
         stock(fresh_database, [("WIDGET-1", 2599, 10)])
         yield Saga(client, app, fresh_database, topology, channel)
@@ -252,3 +256,32 @@ async def test_successes_racing_the_deadline_end_confirmed_or_refunded(impatient
     assert all(not impatient.refund_requested(o["id"]) for o in confirmed)
     assert all(impatient.refund_requested(o["id"]) for o in cancelled)
     assert stock_of(impatient.url, "BULK-1") == 1000 - len(confirmed)
+
+
+@pytest.fixture
+async def unswept(fresh_database: str, short_topology: Topology, channel: AbstractChannel) -> AsyncIterator[Saga]:
+    """An order service whose own sweeper looks once at startup and then not for an hour: the test sweeps."""
+    async for running_saga in start(fresh_database, short_topology, channel, payment_timeout=30.0, sweep_interval=3600):
+        yield running_saga
+
+
+async def test_an_order_locked_by_a_reply_does_not_hold_up_the_sweeper(unswept: Saga) -> None:
+    """The day-3 review's surviving mutant: `FOR UPDATE` instead of `FOR UPDATE SKIP LOCKED` in the sweeper's claim
+    is as correct (lock_order re-reads the row) but makes the sweeper wait behind a reply's lock on one order while
+    others expire. With SKIP LOCKED it cancels the others at once and leaves the locked one to the next pass."""
+    first, second = await unswept.order(), await unswept.order()
+    with psycopg.connect(unswept.url, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE orders SET payment_deadline = now() - interval '1 second' WHERE id IN (%s, %s)",
+            (first["id"], second["id"]),
+        )
+    pool = unswept.app.state.resources.pool
+    with psycopg.connect(unswept.url) as holder:  # a reply's handler holding the first order's row
+        holder.execute("SELECT 1 FROM orders WHERE id = %s FOR UPDATE", (first["id"],))
+        swept = await asyncio.wait_for(orders.sweep(pool), timeout=3)
+        assert swept == 1
+        assert (await unswept.client.get(f"/orders/{second['id']}")).json()["status"] == "CANCELLED"
+        assert (await unswept.client.get(f"/orders/{first['id']}")).json()["status"] == "AWAITING_PAYMENT"
+        holder.rollback()
+    assert await asyncio.wait_for(orders.sweep(pool), timeout=3) == 1  # the next pass takes it
+    assert (await unswept.client.get(f"/orders/{first['id']}")).json()["status"] == "CANCELLED"
