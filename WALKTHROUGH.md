@@ -41,10 +41,10 @@ doesn't mean no charge: the charge may have happened and its reply be stuck in a
 arrives later, the order stays cancelled and a refund is sent if one hasn't been.
 
 **What if the refund reaches the payment service before the charge?**
-Charge and refund commute there (DESIGN.md's table): a refund with no payment records a *voided* payment for the
-refund's amount and replies `refunded` with 0 charged; a later charge for that order is refused (`voided`) and never
-reaches the provider. That is why `payment.refund` carries the amount and currency (`messages.RefundPayment`): a
-refund that comes first has nothing else to learn them from.
+Charge and refund commute there (DESIGN.md's table): a refund with no payment voids the order at the provider, records
+a *voided* payment for the refund's amount and replies `refunded` with 0 charged; a later charge for that order is
+refused (`voided`) and never reaches the provider. That is why `payment.refund` carries the amount and currency
+(`messages.RefundPayment`): a refund that comes first has nothing else to learn them from.
 
 **Which steps are compensatable, which is the pivot?**
 Reserving stock (undone by releasing it) and charging (undone by refunding) are compensatable; confirming the order is
@@ -325,6 +325,92 @@ currency (the e-mails use each currency's minor unit now).
 - My own reading of the service skeleton found a pool left retrying in the background when its first connections
   timed out at startup: `open()` sat before the `try` whose `finally` closes it.
 
+## The saga as built (day 3)
+
+**Where do the saga's rules live, and how do you know they're right?**
+In two pure functions: `saga.transition(state, event)` for the order (`src/orderly/saga.py`) and
+`payment_rules.decide` / `reply` for the payment (`src/orderly/payment_rules.py`). The services only lock a row, call
+one of them and write what it says. `tests/test_saga.py` lists all 24 (state, input) pairs with their expected
+outcome, so a new state or input without a decided rule fails the table's coverage test; Hypothesis then runs random
+reply sequences through it (duplicates, any order) and checks the property that matters: an order that ends cancelled
+after any successful charge has asked for a refund, and a confirmed one never has. `tests/test_payment_rules.py` does
+the same for charge and refund: any interleaving leaves a refunded order with nothing charged.
+
+**Why does a void call the provider? Isn't "no row" proof nothing was charged?**
+No. The payment service calls the provider with its transaction open, so a charge can reach the provider and the
+transaction never commit: a crash, or the handler's 10 s timeout after the provider has answered. The provider has
+the money and there's no row. If the order's refund comes next and only records `VOIDED`, the customer stays charged.
+So the void is a provider call (`FakeProvider.void`, like cancelling a payment intent): it refunds a charge the
+provider took and closes the order's key so a charge still in flight is refused. I found this while writing the payment
+service, before any test; `test_a_refund_finding_no_row_refunds_a_charge_whose_transaction_was_lost` pins it.
+
+**A charge and a refund for the same order arrive at once. What happens?**
+With prefetch 8 they run in two handlers at once. Both would read "no payment": the charge calls the provider, the
+refund voids, and the second insert hits the unique `order_id`. So `payments.apply` takes a transaction-level advisory
+lock on the order first (`pg_advisory_xact_lock(4113, hashtext(order_id))`): the second waits, then sees the first's
+row. `test_charge_and_refund_delivered_together_never_leave_money_taken` (20 orders, both orders of arrival) fails
+without the lock. An advisory lock rather than `SELECT ... FOR UPDATE` because the row may not exist yet.
+
+**A payment reply and the deadline arrive at the same moment?**
+Both the reply consumer and the sweeper lock the order's row `FOR UPDATE` before calling `transition`. Whichever is
+second waits, then sees the order as the first left it: a success after the cancellation is the "late success" rule
+(refund once, already asked by the deadline), a deadline after the confirmation is ignored. The sweeper claims with
+`SKIP LOCKED`, so it never waits on an order a reply is handling. `test_successes_racing_the_deadline_end_confirmed_or_refunded`
+sends 30 replies around their deadlines and checks every order ends confirmed without a refund or cancelled with one.
+
+**Why does the sweeper cancel one order per transaction?**
+Cancelling releases the order's stock in sku order, which is what keeps it from deadlocking against a reservation
+(which also locks in sku order). Two orders in one transaction would lock A's skus and then B's: not sku order any
+more, and a reservation holding one of B's skus while waiting for one of A's would deadlock with it.
+
+**How does a consumer make handling idempotent?**
+`Consumer._apply` opens the handler's transaction by inserting `(consumer, message_id)` into `processed_messages` with
+`ON CONFLICT DO NOTHING`. Zero rows inserted means a duplicate: acknowledge and stop. Otherwise the handler runs in that
+same transaction, so the id and the effect commit together or not at all. Two copies handled at once are fine: the
+second insert waits on the first's uncommitted key, then conflicts. A crash after the commit and before the ack
+redelivers the message, which then finds its id.
+
+**How do retries work, and why not just requeue?**
+RabbitMQ 4 doesn't count a requeue toward a quorum queue's delivery limit (day 1 measured it), so requeueing on a
+persistent error loops forever. A failed handler instead copies the delivery to a wait queue for its attempt
+(`<queue>.retry.1s`, `5s`, `30s`: quorum queues whose TTL dead-letters the message back to the work queue) with
+`x-orderly-attempt` + 1, waits for the broker's confirm, and only then acknowledges the original. After the third retry
+fails it is rejected to the dead-letter queue. Undecodable messages and `Refused` ones (an unknown order, a contradiction)
+go to the dead-letter queue at once. The delivery limit (10) is left as the backstop for a message that crashes its
+consumer.
+
+**What happens to a charge that keeps failing?**
+After four attempts it's dead-lettered, so no reply ever comes. The order waits out its deadline, is cancelled and
+asks for a refund; the refund voids the order at the provider. `test_a_charge_dead_lettered_after_its_retries_times_out_and_is_refunded`.
+The deadline is what makes dead-lettering a charge safe.
+
+**What did the broker-drop test catch?**
+That the consumer silently stopped consuming. It watched `channel.is_closed`, but aio-pika's robust channel reopens
+itself after a reconnect and reports itself open, and it doesn't restore a subscription made through `get_queue`. Now
+the consumer registers a close callback, and on any close it closes the channel for good and subscribes on a new one.
+The extended test sends a reply after the drop and waits for the order to be confirmed.
+
+**Is the notification exactly once?**
+The record is: `unique (order_id, kind)` and `processed_messages` mean one row per order and kind. The e-mail is at
+least once: it's sent with the transaction open, so a crash after the send and before the commit sends it again on the
+redelivery. Exactly-once delivery to a mailbox would need the mailer to deduplicate on a key we give it.
+
+## What went wrong on day 3
+
+- The first end-to-end test of 60 orders used the fake provider's per-attempt error coin at 30%: about 1 order in 125
+  (0.3^4) failed all four attempts, was dead-lettered and timed out 30 s later. That is the design working, but it
+  made the test flaky. The failures are now fixed by the order id (always recoverable) and the dead-letter path has its
+  own test.
+- A full run once failed `test_health_reports_the_outbox_without_failing_on_it`: closing the broker connection killed
+  the relay and the new consumer with a bare `Exception()`. aiormq fails the calls pending on something closed without a
+  reason with `exception or Exception`; I couldn't reproduce which call it was in a probe, so both workers treat exactly
+  that exception (no subclass, no message) as an outage, and a test injects it into each.
+- A notification test read the dead-letter queue the moment the consumer counted a dead letter, but the broker routes a
+  rejected message there on its own time after the reject. Tests now wait for it.
+- RabbitMQ wouldn't start on this Mac today: its pre-launch asks epmd through the machine's LAN address, which hangs
+  here (loopback answers at once). An `ERL_INETRC` file mapping the host names to 127.0.0.1 fixed it for the local
+  node only; nothing in the repo changed.
+
 ## What went wrong on day 2
 
 - The order view refused PostgreSQL's timestamps: psycopg returns `timestamptz` in the session's time zone (New York
@@ -338,6 +424,6 @@ currency (the e-mails use each currency's minor unit now).
 
 ## What's next
 
-Day 3: the payment and notification services (their consumers and the payment service's outbox), the saga's
-transition function and its consumer in the order service, the deadline sweeper, idempotent consumers
-(`processed_messages`), dead letters and retries with backoff through wait queues.
+Day 4: contract tests (each consumer's expectations against what its producer writes), failure injection (the broker
+stopped mid-run, every message delivered twice, a provider that times out), and the 10,000-order load test against
+the monolith, with end-to-end latency from order to confirmation.
