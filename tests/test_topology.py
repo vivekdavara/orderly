@@ -19,7 +19,7 @@ from orderly.messages import (
     RefundPayment,
     new_message,
 )
-from orderly.topology import DELIVERY_LIMIT, QUEUES, Topology, topic_matches
+from orderly.topology import ATTEMPT_HEADER, DELIVERY_LIMIT, QUEUES, RETRY_DELAYS, Topology, delay_label, topic_matches
 
 ORDER = uuid.UUID("0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11")
 PAYMENT = uuid.UUID("9a4a1f0e-55b5-4c1d-8a0b-2f2e1d0c9b8a")
@@ -266,6 +266,8 @@ async def test_the_exchanges_are_durable_and_of_the_designed_types(
         (topology.events, aio_pika.ExchangeType.TOPIC, False),
         (topology.dead_letters, aio_pika.ExchangeType.TOPIC, True),
         (topology.dead_letters, aio_pika.ExchangeType.DIRECT, False),
+        (topology.retry, aio_pika.ExchangeType.TOPIC, True),
+        (topology.retry, aio_pika.ExchangeType.DIRECT, False),
     ]
     for name, kind, durable in wrong:
         async with connection.channel() as channel:
@@ -286,11 +288,92 @@ async def test_delete_removes_everything_declare_made(connection: AbstractConnec
         await topology.declare(channel)
         await topology.delete(channel)
     names = [name for spec in QUEUES for name in (topology.queue(spec.name), topology.dead_letter_queue(spec.name))]
+    names += [topology.retry_queue(spec.name, delay) for spec in QUEUES for delay in topology.retry_delays]
+    assert len(names) == 3 * (2 + len(RETRY_DELAYS))
     for name in names:
         async with connection.channel() as channel:
             with pytest.raises(aio_pika.exceptions.ChannelNotFoundEntity):
                 await channel.declare_queue(name, passive=True)
-    for exchange in (topology.commands, topology.events, topology.dead_letters):
+    for exchange in (topology.commands, topology.events, topology.dead_letters, topology.retry):
         async with connection.channel() as channel:
             with pytest.raises(aio_pika.exceptions.ChannelNotFoundEntity):
                 await channel.get_exchange(exchange, ensure=True)
+
+
+# The retry wait queues (day 3).
+
+
+def test_the_retry_delays_and_their_queues_are_the_designs() -> None:
+    assert RETRY_DELAYS == (1.0, 5.0, 30.0)
+    topology = Topology(prefix="p.")
+    assert [topology.retry_queue("payment.commands", d) for d in RETRY_DELAYS] == [
+        "p.payment.commands.retry.1s",
+        "p.payment.commands.retry.5s",
+        "p.payment.commands.retry.30s",
+    ]
+    assert topology.retry == "p.orderly.retry"
+    assert topology.retry_queue_arguments("payment.commands", 5.0) == {
+        "x-queue-type": "quorum",
+        "x-message-ttl": 5000,
+        "x-dead-letter-exchange": "",
+        "x-dead-letter-routing-key": "p.payment.commands",
+        "x-dead-letter-strategy": "at-least-once",
+        "x-overflow": "reject-publish",
+    }
+
+
+@pytest.mark.parametrize(("delay", "label"), [(1.0, "1s"), (30.0, "30s"), (0.25, "250ms"), (1.5, "1500ms")])
+def test_a_delay_names_its_queue(delay: float, label: str) -> None:
+    assert delay_label(delay) == label
+
+
+@pytest.mark.parametrize("delays", [(0.0,), (-1.0,), (1.0, 1.0), (0.0001,), (0.25, 0.2504)])
+def test_retry_delays_must_be_distinct_and_at_least_a_millisecond(delays: tuple[float, ...]) -> None:
+    with pytest.raises(ValueError, match="distinct and at least 1 ms"):
+        Topology(retry_delays=delays)
+
+
+async def test_a_message_in_a_wait_queue_comes_back_to_its_work_queue_after_the_delay(
+    connection: AbstractConnection,
+) -> None:
+    topology = Topology(prefix=f"test-{uuid.uuid4().hex[:12]}.", retry_delays=(0.2, 0.6))
+    async with connection.channel() as setup:
+        await topology.declare(setup)
+    try:
+        async with await open_channel(connection) as channel:
+            retry = await channel.get_exchange(topology.retry, ensure=False)
+            for spec in QUEUES:
+                for delay in topology.retry_delays:
+                    started = asyncio.get_running_loop().time()
+                    await retry.publish(
+                        aio_pika.Message(b"body", headers={ATTEMPT_HEADER: 2}, delivery_mode=2),
+                        routing_key=topology.retry_queue(spec.name, delay),
+                        mandatory=True,
+                    )
+                    work = await channel.get_queue(topology.queue(spec.name), ensure=False)
+                    incoming = None
+                    while incoming is None:
+                        assert asyncio.get_running_loop().time() - started < delay + 5, "never came back"
+                        incoming = await work.get(fail=False, no_ack=True)
+                        await asyncio.sleep(0.01)
+                    waited = asyncio.get_running_loop().time() - started
+                    assert waited >= delay * 0.9, f"{spec.name} back after {waited:.3f} s, delay {delay}"
+                    assert incoming.body == b"body" and incoming.headers[ATTEMPT_HEADER] == 2
+                    deaths = incoming.headers["x-death"]
+                    assert isinstance(deaths, list) and isinstance(deaths[0], dict)
+                    assert deaths[0]["reason"] == "expired"
+    finally:
+        async with connection.channel() as cleanup:
+            await topology.delete(cleanup)
+
+
+async def test_the_wait_queues_are_quorum_queues_with_their_ttl(
+    connection: AbstractConnection, topology: Topology
+) -> None:
+    for spec in QUEUES:
+        for delay in topology.retry_delays:
+            name = topology.retry_queue(spec.name, delay)
+            wrong = {**topology.retry_queue_arguments(spec.name, delay), "x-message-ttl": round(delay * 1000) + 1}
+            async with connection.channel() as channel:
+                with pytest.raises(aio_pika.exceptions.ChannelPreconditionFailed):
+                    await channel.declare_queue(name, durable=True, arguments=wrong)
