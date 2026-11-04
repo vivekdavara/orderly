@@ -29,7 +29,7 @@ from fastapi.responses import JSONResponse
 
 from orderly import outbox
 from orderly.consumer import Connection, Consumer, Refused
-from orderly.fakes import Charge, ProviderConflict, Refund, provider_from_environment
+from orderly.fakes import Charge, ProviderConflict, ProviderVoided, Refund, provider_from_environment
 from orderly.messages import ChargePayment, Message, RefundPayment, new_message
 from orderly.outbox import Relay
 from orderly.payment_rules import PaymentConflict, PaymentRow, decide, reply
@@ -88,9 +88,16 @@ async def apply(conn: Connection, message: Message, provider: Provider) -> None:
         action = decide(row, command)
         if action == "charge":
             assert isinstance(command, ChargePayment)
-            charge = await provider.charge(order_id, command.customer_id, command.amount_cents, command.currency)
-            status = "CHARGED" if charge.approved else "DECLINED"
-            row = await _insert(conn, order_id, status, command.amount_cents, command.currency, charge.reference)
+            try:
+                charge = await provider.charge(order_id, command.customer_id, command.amount_cents, command.currency)
+            except ProviderVoided:
+                # A refund's void reached the provider and its transaction was lost (so no row says so yet): the
+                # provider will never take this charge. Record what it says, and answer as the table does for a
+                # voided payment, rather than dead-lettering the charge (day-3 review).
+                row = await _insert(conn, order_id, "VOIDED", command.amount_cents, command.currency)
+            else:
+                status = "CHARGED" if charge.approved else "DECLINED"
+                row = await _insert(conn, order_id, status, command.amount_cents, command.currency, charge.reference)
         elif action == "void":
             settled = await provider.void(order_id, command.amount_cents, command.currency)
             if settled is None:

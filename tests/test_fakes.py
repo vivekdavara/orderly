@@ -15,6 +15,7 @@ from orderly.fakes import (
     MailerUnavailable,
     ProviderConflict,
     ProviderUnavailable,
+    ProviderVoided,
     fraction,
 )
 
@@ -203,7 +204,7 @@ async def test_refund_errors_are_keyed_by_attempt_and_refund_nothing() -> None:
 async def test_a_void_closes_the_key_and_refunds_a_charge_already_taken() -> None:
     provider = FakeProvider()
     assert await provider.void(ORDERS[1], 2599, "USD") is None
-    with pytest.raises(ProviderConflict, match="voided"):
+    with pytest.raises(ProviderVoided, match="voided"):
         await provider.charge(ORDERS[1], "c-1", 2599, "USD")  # a charge still in flight when the order gave up
     assert provider.charges == {} and provider.net_cents() == 0
     # A charge taken before the void (its reply lost in a crash) is refunded by it.

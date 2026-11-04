@@ -33,6 +33,10 @@ class ProviderConflict(Exception):
     """A charge reused an order id (the idempotency key) with a different amount or currency."""
 
 
+class ProviderVoided(ProviderConflict):
+    """A charge for an order whose key was voided: the provider will never take it."""
+
+
 @dataclass(frozen=True)
 class Charge:
     order_id: uuid.UUID
@@ -88,7 +92,7 @@ class FakeProvider:
                 )
             return previous
         if order_id in self.voided:
-            raise ProviderConflict(f"order {order_id} was voided: no charge with its key is taken")
+            raise ProviderVoided(f"order {order_id} was voided: no charge with its key is taken")
         declined = customer_id in self.declined_customers or fraction(order_id, "decline") < self.decline_ratio
         charge = Charge(
             order_id=order_id,

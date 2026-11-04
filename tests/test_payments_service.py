@@ -254,3 +254,20 @@ async def test_a_command_contradicting_the_payment_is_dead_lettered(service: Pay
     [dead] = await take(service.channel, service.topology.dead_letter_queue("payment.commands"), 1)
     assert decode(dead.body).payload.TYPE == "payment.refund"
     assert service.provider.net_cents() == 2599  # nothing moved on the contradiction
+
+
+async def test_a_charge_after_a_void_whose_transaction_was_lost_is_answered_voided(service: PaymentService) -> None:
+    """The day-3 review: a refund's void reached the provider, then its transaction was lost (no row). The charge that
+    comes next must be answered "failed (voided)", as DESIGN's table says, not dead-lettered as a conflict."""
+    order_id = uuid.uuid4()
+    assert await service.provider.void(order_id, 2599, "USD") is None  # the lost attempt
+    await service.send(charge(order_id))
+    [answer] = await service.replies(1)
+    assert isinstance(answer.payload, PaymentFailed) and answer.payload.reason == "voided"
+    assert service.row(order_id) == ("VOIDED", 2599, None, None)
+    assert service.consumer.stats["dead_lettered"] == 0
+    # The refund's own redelivery then finds the void recorded.
+    await service.send(refund(order_id))
+    [refunded] = await service.replies(1)
+    assert isinstance(refunded.payload, PaymentRefunded) and refunded.payload.amount_cents == 0
+    assert service.provider.net_cents() == 0
