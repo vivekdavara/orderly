@@ -415,6 +415,13 @@ makes the sweeper wait behind a reply's lock, so there's a test for that now.
 No lock-order cycle, stock released exactly once, the rules matching DESIGN's tables, and the consumer consuming again
 after 30 random connection drops.
 
+**And the second round?**
+It asked what the fixes broke, and found two defects in my bounded stop: a cancel that times out leaves the
+subscription live, so deliveries kept starting handlers that the drain (waiting for a snapshot) didn't wait for, and
+`stop_bound` didn't count the open or the subscription's calls, which had no timeout. Now no handler starts once a stop
+has begun, every channel call has a 2 s `control_timeout`, and the bound is 24 s against shutdown's 30. The lesson,
+again: a fix for a timeout needs its own review, because bounding one wait changes what happens after it.
+
 ## What went wrong on day 3
 
 - The first end-to-end test of 60 orders used the fake provider's per-attempt error coin at 30%: about 1 order in 125

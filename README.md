@@ -66,7 +66,7 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `scripts/postgres.sh` | Creates, migrates, lists and drops Orderly's databases on the local PostgreSQL 14 (`ORDERLY_PG_PREFIX` renames them) |
 | `scripts/measure_test_fixture.py` | Times CREATE DATABASE against CREATE SCHEMA (why each test gets a schema) |
 | `scripts/measure_relay.py`, `scripts/measure_intake.py` | The relay's throughput by batch size; order intake, monolith against order service, on one hot product |
-| `tests/` | 522 tests: unit, property and integration tests against the real servers, whole sagas through the three services |
+| `tests/` | 530 tests: unit, property and integration tests against the real servers, whole sagas through the three services |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
 ## Run it
@@ -127,8 +127,8 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 522 tests in about 2 minutes here (120.5 s for the pytest part of a run at 15:50 on day 3, 516
-tests; 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 3's (147 new):
+`make check` runs 530 tests in about 2 minutes here (120.5 s for the pytest part of a run at 15:50 on day 3, 516
+tests; 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 3's (155 new):
 
 - **The saga's rules** (54, `tests/test_saga.py`): the full table of 24 (state, input) pairs, each with its outcome,
   status and effects, and which are anomalies; only a step out of awaiting payment changes the status or releases
@@ -138,12 +138,13 @@ tests; 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 3's (147 new):
 - **The payment rules** (27, `tests/test_payment_rules.py`): the table for every row and command, contradictions
   refused, and Hypothesis sequences of charges and refunds in any order: a refunded order ends with nothing charged,
   money never negative nor above one charge, a repeated command answered alike.
-- **The consumer** (17, `tests/test_consumer.py`, real servers, 0.2/0.4 s delays): handled once; a duplicate skipped;
+- **The consumer** (18, `tests/test_consumer.py`, real servers, 0.2/0.4 s delays): handled once; a duplicate skipped;
   eight concurrent copies handled once; concurrency up to the prefetch; undecodable and foreign types dead-lettered;
   two failures then success with each delay between attempts and one effect; failing for good dead-lettered after the
   last delay with nothing kept and the id unrecorded (so a replay is handled); `Refused`; the handler timeout; a stop
   mid-handler that still commits and acknowledges; aiormq's bare `Exception()` survived; the stop's bound against the
-  services' stop timeout, a broker that never answers the cancel, a cancel on a channel closed under it still draining.
+  services' stop timeout, a broker that never answers the cancel or the close, a cancel on a channel closed under it
+  still draining.
 - **The payment service** (10): approved and declined charges; a redelivery deduplicated and a repeated command
   answered with the same payment; a refund after the charge; a refund first, and the charge never taken; a charge whose
   transaction was lost refunded by the void; 20 orders with charge and refund delivered together ending with nothing
@@ -165,8 +166,10 @@ tests; 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 3's (147 new):
   voided).
 - **The retry topology** (12 in `tests/test_topology.py`): names, arguments, labels and validation; a message coming
   back to each work queue after each delay with its body and attempt header; the TTL fixed at declaration. **Fakes**
-  (5): refunds and voids, idempotent, only of an approved charge of that amount. **The review's** (1,
-  `tests/review_d3/`): failed 3 of 3 on the code it was written against, passes now.
+  (5): refunds and voids, idempotent, only of an approved charge of that amount. **The reviews'** (3,
+  `tests/review_d3/`, `tests/review_d3r2/`): each failed 3 of 3 on the code it was written against, passes now. **The
+  skeleton** (5): a pool timeout above 5 s, or of 0 or less, refused at startup; the relay's margin with the longest one
+  accepted.
 
 Day 2's:
 
@@ -319,6 +322,24 @@ duplicate retry chains if a handler outlived the drain, which the bounds rule ou
 retry publish at 5 s, the drain waits 16 s). What held: the transition function and payment rules against DESIGN's
 tables; no lock-order cycle among the advisory lock, `processed_messages`, the order rows and the products; stock
 released exactly once; 30 random connection drops (4 seeds) with the consumer always consuming again afterwards.
+
+A second round (one agent at `36be0f3`, 16:20-16:27, "what did the fixes break?", `tests/review_d3r2/`) found two
+defects, both in the bounded stop the first round's follow-up added (`a913720`), and both fixed in `70884c5`, each
+test failing 3 of 3 before:
+
+| Defect | Fix |
+|---|---|
+| A cancel that times out leaves the subscription live (aiormq forgets a consumer only on `CancelOk`): new deliveries started handlers during the drain, which waited only for its snapshot, so `run` returned with a handler running, which then committed and acknowledged on a closed channel | once a stop begins, a delivery starts no handler (left unacknowledged, it goes back with the channel); the drain waits for the live set |
+| `stop_bound` wasn't a bound: the subscription's calls had no timeout and the open wasn't counted | every channel call bounded by `control_timeout` (2 s); `stop_bound` = 4 × 2 + 16 = 24 s, under the 30 s `STOP_TIMEOUT` |
+
+Its surviving mutant (the close's timeout removed) has a test now. Its two tests' setup is adapted to `control_timeout`
+(assertions unchanged). Of the two guards in the first fix, the test fails only with both removed: the stop flag alone
+is enough (it is set before the drain), the drain's loop is a second guard. Unproven and not acted on: a charge
+redelivered after a void that refunded an earlier charge, with the void's transaction lost, gets the provider's old
+approved charge back, so the row says `CHARGED` until the refund's retry makes it `REFUNDED` (the books stay wrong,
+though the customer is refunded, if that lost transaction was the refund's last attempt). What held: `ProviderVoided`
+against every row state and ordering, the `RuntimeError` conversion limited to the subscription, notifications under
+concurrency, the sweeper with a reply holding the row.
 
 ## Review of day 2
 
