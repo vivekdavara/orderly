@@ -271,3 +271,19 @@ async def test_a_charge_after_a_void_whose_transaction_was_lost_is_answered_void
     [refunded] = await service.replies(1)
     assert isinstance(refunded.payload, PaymentRefunded) and refunded.payload.amount_cents == 0
     assert service.provider.net_cents() == 0
+
+
+async def test_a_charge_after_a_lost_void_that_refunded_it_is_recorded_refunded(service: PaymentService) -> None:
+    """The day-3 review's second round (unproven there): a charge was taken and its transaction lost; the refund's void
+    refunded it at the provider and its transaction was lost too. The charge's redelivery got the provider's old
+    "approved" back, so the row said CHARGED while the money had been given back. Now the books say REFUNDED."""
+    order_id = uuid.uuid4()
+    await service.provider.charge(order_id, "c-42", 2599, "USD")  # the lost charge
+    assert await service.provider.void(order_id, 2599, "USD") is not None  # the lost void, refunding it
+    await service.send(charge(order_id))
+    [answer] = await service.replies(1)
+    assert isinstance(answer.payload, PaymentFailed) and answer.payload.reason == "voided"
+    status, amount, charge_ref, refund_ref = service.row(order_id) or ("", 0, None, None)
+    assert (status, amount) == ("REFUNDED", 2599)
+    assert charge_ref == f"ch_{order_id.hex[:24]}" and refund_ref == f"re_{order_id.hex[:24]}"
+    assert service.provider.net_cents() == 0

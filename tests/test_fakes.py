@@ -212,7 +212,9 @@ async def test_a_void_closes_the_key_and_refunds_a_charge_already_taken() -> Non
     settled = await provider.void(ORDERS[2], 2599, "USD")
     assert settled is not None and settled[0] == charge and settled[1].amount_cents == 2599
     assert await provider.void(ORDERS[2], 2599, "USD") == settled  # idempotent
-    assert await provider.charge(ORDERS[2], "c-1", 2599, "USD") == charge  # the key's first answer, still refunded
+    with pytest.raises(ProviderVoided) as voided:  # not the key's first answer: that charge was refunded
+        await provider.charge(ORDERS[2], "c-1", 2599, "USD")
+    assert voided.value.settled == settled
     assert provider.net_cents(ORDERS[2]) == 0
 
 

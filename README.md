@@ -66,7 +66,7 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `scripts/postgres.sh` | Creates, migrates, lists and drops Orderly's databases on the local PostgreSQL 14 (`ORDERLY_PG_PREFIX` renames them) |
 | `scripts/measure_test_fixture.py` | Times CREATE DATABASE against CREATE SCHEMA (why each test gets a schema) |
 | `scripts/measure_relay.py`, `scripts/measure_intake.py` | The relay's throughput by batch size; order intake, monolith against order service, on one hot product |
-| `tests/` | 530 tests: unit, property and integration tests against the real servers, whole sagas through the three services |
+| `tests/` | 531 tests: unit, property and integration tests against the real servers, whole sagas through the three services |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
 ## Run it
@@ -127,8 +127,8 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 530 tests in about 2 minutes here (120.5 s for the pytest part of a run at 15:50 on day 3, 516
-tests; 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 3's (155 new):
+`make check` runs 531 tests in about 2 minutes here (120.5 s for the pytest part of a run at 15:50 on day 3, 516
+tests; 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 3's (156 new):
 
 - **The saga's rules** (54, `tests/test_saga.py`): the full table of 24 (state, input) pairs, each with its outcome,
   status and effects, and which are anomalies; only a step out of awaiting payment changes the status or releases
@@ -145,11 +145,11 @@ tests; 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 3's (155 new):
   mid-handler that still commits and acknowledges; aiormq's bare `Exception()` survived; the stop's bound against the
   services' stop timeout, a broker that never answers the cancel or the close, a cancel on a channel closed under it
   still draining.
-- **The payment service** (10): approved and declined charges; a redelivery deduplicated and a repeated command
+- **The payment service** (11): approved and declined charges; a redelivery deduplicated and a repeated command
   answered with the same payment; a refund after the charge; a refund first, and the charge never taken; a charge whose
   transaction was lost refunded by the void; 20 orders with charge and refund delivered together ending with nothing
   charged (fails without the per-order lock); a provider outage retried; a contradiction dead-lettered; a charge after
-  a lost void answered "voided" (10 in all).
+  a lost void answered "voided", and one after a lost void that refunded it recorded `REFUNDED` (11 in all).
 - **The order service's saga** (9): a success confirms and announces; a decline cancels and returns the stock; the
   deadline cancels, returns the stock and asks for a refund; a success after the deadline covered by that refund; a
   success after a decline refunded once; ruled-out replies changing nothing; an unknown order dead-lettered; 30
@@ -334,10 +334,11 @@ test failing 3 of 3 before:
 
 Its surviving mutant (the close's timeout removed) has a test now. Its two tests' setup is adapted to `control_timeout`
 (assertions unchanged). Of the two guards in the first fix, the test fails only with both removed: the stop flag alone
-is enough (it is set before the drain), the drain's loop is a second guard. Unproven and not acted on: a charge
-redelivered after a void that refunded an earlier charge, with the void's transaction lost, gets the provider's old
-approved charge back, so the row says `CHARGED` until the refund's retry makes it `REFUNDED` (the books stay wrong,
-though the customer is refunded, if that lost transaction was the refund's last attempt). What held: `ProviderVoided`
+is enough (it is set before the drain), the drain's loop is a second guard. Its unproven suspicion was real and is fixed
+(`test_a_charge_after_a_lost_void_that_refunded_it_is_recorded_refunded`): a charge redelivered after a void that had
+refunded an earlier charge (both transactions lost) got the provider's old "approved" back, so the row said `CHARGED`
+while the money had been given back (and stayed wrong if the refund's retries ran out). A voided key now refuses even
+its old charge, saying what the void settled, and the payment service records `REFUNDED` with both references. What held: `ProviderVoided`
 against every row state and ordering, the `RuntimeError` conversion limited to the subscription, notifications under
 concurrency, the sweeper with a reply holding the row.
 

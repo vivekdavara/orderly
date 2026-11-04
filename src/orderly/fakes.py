@@ -34,7 +34,12 @@ class ProviderConflict(Exception):
 
 
 class ProviderVoided(ProviderConflict):
-    """A charge for an order whose key was voided: the provider will never take it."""
+    """A charge for an order whose key was voided: the provider will never take it. `settled` is the charge the void
+    refunded and its refund, if it had taken one before the void (else None)."""
+
+    def __init__(self, message: str, settled: tuple[Charge, Refund] | None = None) -> None:
+        super().__init__(message)
+        self.settled = settled
 
 
 @dataclass(frozen=True)
@@ -84,15 +89,19 @@ class FakeProvider:
         if fraction(order_id, f"error:{self.attempts[order_id]}") < self.error_ratio:
             raise ProviderUnavailable(f"charge for order {order_id} failed (attempt {self.attempts[order_id]})")
         previous = self.charges.get(order_id)
-        if previous is not None:
-            if (previous.amount_cents, previous.currency) != (amount_cents, currency):
-                raise ProviderConflict(
-                    f"order {order_id} was charged {previous.amount_cents} {previous.currency}, "
-                    f"now asked for {amount_cents} {currency}"
-                )
-            return previous
+        if previous is not None and (previous.amount_cents, previous.currency) != (amount_cents, currency):
+            raise ProviderConflict(
+                f"order {order_id} was charged {previous.amount_cents} {previous.currency}, "
+                f"now asked for {amount_cents} {currency}"
+            )
         if order_id in self.voided:
-            raise ProviderVoided(f"order {order_id} was voided: no charge with its key is taken")
+            # Before the idempotent answer: a charge the void refunded must not come back as "approved" (the day-3
+            # review's second round: the payment row then said CHARGED while the money had been given back).
+            refund = self.refunds.get(order_id)
+            settled = None if previous is None or refund is None else (previous, refund)
+            raise ProviderVoided(f"order {order_id} was voided: no charge with its key is taken", settled)
+        if previous is not None:
+            return previous
         declined = customer_id in self.declined_customers or fraction(order_id, "decline") < self.decline_ratio
         charge = Charge(
             order_id=order_id,

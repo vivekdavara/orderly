@@ -267,7 +267,9 @@ then answered `failed (voided)` without reaching the provider; either way the pr
   order's key, so a charge request still in flight is refused. Found while writing the payment service; pinned by
   `test_a_refund_finding_no_row_refunds_a_charge_whose_transaction_was_lost`. The other way round (the void reached the
   provider, its transaction was lost, the charge comes next): the provider refuses the charge (`ProviderVoided`), and
-  the payment service records `VOIDED` and answers `failed (voided)`, as the table does (day-3 review).
+  the payment service records `VOIDED` and answers `failed (voided)`, as the table does (day-3 review). If that void
+  had refunded a charge taken earlier, the provider refuses even the key's old charge and says what the void settled,
+  and the row is `REFUNDED` with both references (second round).
 - **One command at a time per order.** The payment service takes a transaction-level advisory lock on the order
   (`pg_advisory_xact_lock(4113, hashtext(order_id))`) before reading its row, so a charge and a refund delivered at once
   (prefetch 8, or two instances) are applied one after the other, never both against "no payment yet".

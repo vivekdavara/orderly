@@ -90,11 +90,24 @@ async def apply(conn: Connection, message: Message, provider: Provider) -> None:
             assert isinstance(command, ChargePayment)
             try:
                 charge = await provider.charge(order_id, command.customer_id, command.amount_cents, command.currency)
-            except ProviderVoided:
+            except ProviderVoided as voided:
                 # A refund's void reached the provider and its transaction was lost (so no row says so yet): the
                 # provider will never take this charge. Record what it says, and answer as the table does for a
-                # voided payment, rather than dead-lettering the charge (day-3 review).
-                row = await _insert(conn, order_id, "VOIDED", command.amount_cents, command.currency)
+                # voided or refunded payment, rather than dead-lettering the charge (day-3 review). If the void had
+                # refunded a charge taken earlier, the books say so: REFUNDED, with both references (round 2).
+                if voided.settled is None:
+                    row = await _insert(conn, order_id, "VOIDED", command.amount_cents, command.currency)
+                else:
+                    taken, refund = voided.settled
+                    row = await _insert(
+                        conn,
+                        order_id,
+                        "REFUNDED",
+                        taken.amount_cents,
+                        taken.currency,
+                        taken.reference,
+                        refund.reference,
+                    )
             else:
                 status = "CHARGED" if charge.approved else "DECLINED"
                 row = await _insert(conn, order_id, status, command.amount_cents, command.currency, charge.reference)
