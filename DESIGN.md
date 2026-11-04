@@ -196,7 +196,7 @@ The payment service is the other half of the timeout rule. It keeps one row per 
 
 | Payment row | `payment.charge` | `payment.refund` |
 |---|---|---|
-| none | charge; `succeeded` or `failed` | record `voided` for the refund's amount; `refunded` (0 charged) |
+| none | charge; `succeeded` or `failed` | void the order at the provider: `refunded`, for what it had taken (usually 0, `VOIDED`) |
 | charged | reply `succeeded` again (same payment) | refund through the provider; `refunded` |
 | declined | reply `failed` again | nothing to refund; `refunded` (amount 0) |
 | refunded / voided | reply `failed` (`voided`), never charge | reply `refunded` again |
@@ -204,6 +204,48 @@ The payment service is the other half of the timeout rule. It keeps one row per 
 So whichever of charge and refund arrives first (retries and dead-letter replays can reorder them), the customer ends
 up not charged for a cancelled order. Calls to the provider carry the order id as an idempotency key, so a charge
 retried after a timeout cannot charge twice.
+
+**As built (day 3)**:
+
+- `orderly.saga.transition(state, event)` is the order's rules as a pure, total function: 4 states (awaiting,
+  confirmed, cancelled, cancelled with a refund asked) by 6 inputs (succeeded, declined, voided, refunded with an
+  amount, refunded with 0, the deadline), 24 pairs, every one in the tests' table. Replies the protocol rules out (a
+  void or a refund before the order asked for a refund, a failure or refund after a success) are ignored and logged as
+  anomalies: acting on them would let a bug elsewhere undo a confirmed order. An awaiting order that gets a void still
+  cancels at its deadline, so ignoring it is safe. Hypothesis runs random reply sequences through it: stock released,
+  outcome announced and refund asked at most once; an order that ends cancelled after any success always asked for a
+  refund, and a confirmed one never did.
+- `orderly.payment_rules` is the payment table as two pure functions: `decide(row, command)` (charge, refund, void, or
+  answer again) and `reply(row, command)`, computed from the row after the command, so a repeated command gets the
+  first one's answer. A command whose amount or currency contradicts the row is refused (dead-lettered), never guessed
+  at.
+- **Refund before any recorded charge voids at the provider, not only in the table.** A charge can reach the provider
+  and its transaction never commit (a crash, the handler's timeout after the provider answered): the provider has the
+  money and the payment service has no row. If the order's refund then arrives first, recording `VOIDED` would leave
+  the customer charged for a cancelled order. So the void is a provider call (like cancelling a payment intent): it
+  refunds a charge the provider already took (the row becomes `REFUNDED`, the reply carries the amount) and closes the
+  order's key, so a charge request still in flight is refused. Found while writing the payment service; pinned by
+  `test_a_refund_finding_no_row_refunds_a_charge_whose_transaction_was_lost`.
+- **One command at a time per order.** The payment service takes a transaction-level advisory lock on the order
+  (`pg_advisory_xact_lock(4113, hashtext(order_id))`) before reading its row, so a charge and a refund delivered at once
+  (prefetch 8, or two instances) are applied one after the other, never both against "no payment yet".
+  `test_charge_and_refund_delivered_together_never_leave_money_taken` fails without it.
+- The provider is called **with the transaction open**. It holds a pooled connection for the provider's latency (the
+  consumer's prefetch, 8, stays under the pool's 10), but there is no intermediate "charging" state to recover: a retry
+  asks the provider again and gets the first answer (idempotent by order id).
+- **The order service** applies replies and the deadline the same way: lock the order's row `FOR UPDATE`, ask
+  `transition`, apply the `Step` in that transaction (status, stock released in sku order, `payment.refund` with
+  `refund_requested` set, `order.confirmed`/`order.cancelled`, each caused by the reply). The row lock is what makes a
+  reply racing the deadline safe: one waits for the other and sees the order as it left it
+  (`test_successes_racing_the_deadline_end_confirmed_or_refunded`). A reply for an order it doesn't have is refused:
+  orders commit before their charge is even written, so waiting can't help.
+- **The sweeper** (a worker of the order service, every second, at most 100 orders a pass) cancels one order per
+  transaction: claim one expired order `FOR UPDATE SKIP LOCKED`, apply the deadline, commit. Two orders cancelled in one
+  transaction would release products out of sku order (A's skus, then B's) and could deadlock against a reservation.
+- **The notification service** inserts the notification's row (`unique (order_id, kind)`), sends the e-mail with the
+  transaction open, commits. A failed send rolls the row back and is retried; a second event for the same fact under
+  another id sends nothing. The e-mail is the one effect outside a database, so it is at least once: a crash between
+  the send and the commit sends it again.
 
 ## Messages
 
@@ -278,7 +320,12 @@ Declared by one module (`orderly.topology`) at every service start, so the broke
 - RabbitMQ 4.3 refuses a topic binding key with more than two `#` wildcards; Orderly's bindings use none.
 - Retries with backoff (day 3) go through `orderly.retry` and one wait queue per delay (`<queue>.retry.<n>s`, a
   per-queue message TTL, dead-lettering back to the work queue when it expires): RabbitMQ has no delayed delivery
-  without a plugin, and per-queue TTLs expire in order, unlike per-message ones.
+  without a plugin, and per-queue TTLs expire in order, unlike per-message ones. As built: delays of 1 s, 5 s and
+  30 s (`RETRY_DELAYS`), so a message is handled at most 4 times before it is dead-lettered; the wait queues are quorum
+  queues dead-lettering at least once through the default exchange back to their work queue; the attempt number
+  travels in the `x-orderly-attempt` header. One probe on the local node (RabbitMQ 4.3.6) saw a message in a 0.3 s
+  wait queue come back to its work queue in 0.31 s; `tests/test_topology.py` checks every wait queue gives its messages
+  back no earlier than 90% of its delay.
 - Publishing uses publisher confirms and `mandatory`, and messages are persistent: a message the broker can't route is
   an error at the publisher, not a silent drop.
 
@@ -350,6 +397,27 @@ and only then acknowledges. A crash before the acknowledgement means a redeliver
 notification table also has `unique (order_id, kind)`, so even an event published twice under different ids (which the
 outbox never does) can't send two e-mails.
 
+**As built** (`orderly.consumer.Consumer`, one per service):
+
+- Up to `prefetch` (8) deliveries are handled at once, each in a task of the consumer's own (closing a channel cancels
+  aiormq's consumer tasks, and a handler that has committed must be allowed to acknowledge). Two copies of one message
+  handled at once are safe: the second insert of the id waits for the first's commit, then finds it.
+- Decoding comes first: an invalid message, or a type this consumer doesn't take, is rejected without requeue (to the
+  dead-letter queue) at once.
+- A handler that fails (any exception but `Refused`, including `handler_timeout`, 10 s) rolls back; the delivery is
+  copied to its attempt's wait queue with the next attempt number, confirmed, and then acknowledged. After the last
+  delay the next failure dead-letters it. `Refused` (an unknown order, a contradiction) dead-letters at once. Nothing is
+  requeued, since RabbitMQ 4 doesn't count requeues toward the delivery limit. If the broker can't take the copy, the
+  consumer closes its channel instead of acknowledging, so the delivery comes back counted toward the limit.
+- A stop cancels the subscription, waits for the handlers in flight (each bounded by its timeout), then closes the
+  channel.
+- After any close of its channel (a broker drop included) the consumer closes the channel for good and subscribes on a
+  new one. Watching `is_closed` alone wasn't enough: aio-pika's robust channel reopens itself after a reconnect and
+  reports itself open again, without the subscription, and the consumer silently stopped consuming (found by the
+  broker-drop test).
+- aiormq fails the calls pending on a connection closed without a reason with a bare `Exception()`; the consumer and the
+  relay treat exactly that one (no subclass, no message: `broker.closed_without_reason`) as an outage, not a death.
+
 ## Failures and how each is handled
 
 | Failure | What happens |
@@ -363,6 +431,11 @@ outbox never does) can't send two e-mails.
 | An undecodable message | Dead-lettered at once |
 | The payment reply never arrives | The deadline cancels the order and sends a refund |
 | Charge and refund reordered | They commute (table above) |
+| Charge and refund delivered at once | The payment service's per-order lock applies one, then the other (day 3) |
+| A charge reached the provider, its transaction didn't commit | The refund voids at the provider, which refunds it (day 3) |
+| A charge fails all its attempts | Dead-lettered; the order times out and its refund voids the order (day 3) |
+| A reply and the deadline at once | Both lock the order's row; the second sees the first's outcome (day 3) |
+| A broker drop under a consumer | It closes its channel for good and subscribes again (day 3) |
 
 ## Data
 
