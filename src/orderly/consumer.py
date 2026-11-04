@@ -103,6 +103,12 @@ class Consumer:
                 log.warning("consumer %s: %r; subscribing again in %.1f s", self.name, e, backoff)
                 await wait_any(stop, timeout=backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
+            except Exception as error:
+                if not broker.closed_without_reason(error):
+                    raise
+                log.warning("consumer %s: the broker closed a call (%r); subscribing again", self.name, error)
+                await wait_any(stop, timeout=backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
 
     async def _open_channel(self) -> AbstractChannel:
         if self.connection.is_closed:
@@ -116,13 +122,23 @@ class Consumer:
 
     async def _consume_until(self, stop: asyncio.Event) -> None:
         channel = self._channel = await self._open_channel()
+        # Set by every close of the channel underneath, a lost connection's included. A robust channel reopens itself
+        # after a reconnect and then reports itself open again, but without this subscription (get_queue doesn't
+        # register the queue for restoring): watching is_closed alone, the consumer missed a broker drop and never
+        # consumed again (found by the drop test). So on any close it closes the channel for good and subscribes anew.
+        lost = asyncio.Event()
+
+        def on_close(*_: object) -> None:
+            lost.set()
+
+        channel.close_callbacks.add(on_close)
         try:
             await channel.set_qos(prefetch_count=self.prefetch)
             queue = await channel.get_queue(self.topology.queue(self.queue), ensure=False)
             tag = await queue.consume(self._on_delivery)
-            while not stop.is_set() and not channel.is_closed:
-                await wait_any(stop, timeout=0.5)
-            if not channel.is_closed:
+            while not stop.is_set() and not lost.is_set() and not channel.is_closed:
+                await wait_any(stop, lost, timeout=0.5)
+            if not lost.is_set() and not channel.is_closed:
                 with contextlib.suppress(aio_pika.exceptions.AMQPError, ConnectionError):
                     await queue.cancel(tag)  # no new deliveries; the ones in flight still finish and acknowledge
             await self._drain()

@@ -18,8 +18,8 @@ from fastapi import FastAPI
 from helpers import count, running, stock, stock_of
 
 from orderly import orders, outbox
-from orderly.broker import amqp_url
-from orderly.messages import ChargePayment, Message, decode
+from orderly.broker import amqp_url, publish
+from orderly.messages import ChargePayment, Message, PaymentSucceeded, decode, new_message
 from orderly.service import Resources, Settings
 from orderly.topology import Topology
 
@@ -143,9 +143,9 @@ async def test_orders_are_taken_while_the_broker_is_down_and_wait_in_the_outbox(
     assert health.status_code == 503 and health.json()["problems"] == {"broker": "connection closed"}
 
 
-async def test_the_relay_is_a_worker_of_the_service(service: OrderService) -> None:
+async def test_the_relay_the_consumer_and_the_sweeper_are_workers_of_the_service(service: OrderService) -> None:
     resources: Resources = service.app.state.resources
-    assert [task.get_name() for task in resources.workers] == ["orders.relay"]
+    assert [task.get_name() for task in resources.workers] == ["orders.relay", "orders.consumer", "orders.sweeper"]
     assert (await service.client.get("/health")).json()["problems"] == {}
 
 
@@ -175,8 +175,18 @@ async def test_after_a_broker_drop_the_relay_reconnects_and_drains_the_outbox(
         commands = await service.commands(3, timeout=15.0)
         assert sorted(str(c.payload.order_id) for c in commands) == sorted(taken)
         assert outbox_rows(fresh_database) == [("payment.charge", True)] * 4
-        assert [task.done() for task in resources.workers] == [False]
+        # The reply consumer and the sweeper survived the drop too, and the consumer is subscribed again: a reply sent
+        # after the drop confirms its order.
+        assert [task.done() for task in resources.workers] == [False, False, False]
         assert (await client.get("/health")).json()["problems"] == {}
+        success = PaymentSucceeded(
+            order_id=uuid.UUID(taken[0]), payment_id=uuid.uuid4(), amount_cents=2599, currency="USD"
+        )
+        await publish(channel, topology, new_message(success))
+        deadline = time.monotonic() + 15
+        while (await client.get(f"/orders/{taken[0]}")).json()["status"] != "CONFIRMED":
+            assert time.monotonic() < deadline, "the reply wasn't consumed after the broker drop"
+            await asyncio.sleep(0.05)
 
 
 async def test_the_service_relay_listens_so_a_command_goes_out_long_before_its_poll(

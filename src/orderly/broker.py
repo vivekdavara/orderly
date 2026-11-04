@@ -58,6 +58,14 @@ async def publish(channel: AbstractChannel, topology: Topology, message: Message
     await exchange.publish(to_amqp(message), routing_key=routing_key, mandatory=True)
 
 
+def closed_without_reason(error: BaseException) -> bool:
+    """Whether `error` is aiormq's bare `Exception()`: when a connection or channel is closed without a reason, aiormq
+    fails every call still waiting on it with `exception or Exception` (aiormq/base.py, FutureStore.reject_all). A relay
+    and a consumer died of one when a test closed the broker connection (day 3); it means the broker went away, like
+    any ConnectionError. Only that exact one, with no arguments: a subclass or a message is someone's real error."""
+    return type(error) is Exception and not error.args
+
+
 def from_amqp(incoming: AbstractIncomingMessage) -> Message:
     """Decode a delivery's body (the properties are informational; the body is the truth)."""
     return decode(incoming.body)

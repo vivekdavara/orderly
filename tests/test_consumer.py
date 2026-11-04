@@ -314,3 +314,35 @@ async def test_the_attempt_header_counts_from_one() -> None:
         ({ATTEMPT_HEADER: True}, 1),
     ]:
         assert attempt_of(Fake(headers)) == expected, headers  # type: ignore[arg-type]
+
+
+async def test_a_bare_exception_from_the_broker_client_is_an_outage_not_a_death(
+    start: Start, channel: AbstractChannel, short_topology: Topology, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """aiormq fails the calls pending on a connection closed without a reason with a bare Exception(); the consumer
+    died of it when a test closed the broker (found on day 3). It now backs off and subscribes again."""
+    from orderly import broker
+
+    real = broker.open_channel
+    failures = 0
+
+    async def closed_under_us(connection: AbstractConnection) -> AbstractChannel:
+        nonlocal failures
+        if failures < 2:
+            failures += 1
+            raise Exception()
+        return await real(connection)
+
+    monkeypatch.setattr(broker, "open_channel", closed_under_us)
+    run = await start(Toy())
+    await publish(channel, short_topology, charge())
+    await run.until(lambda: run.consumer.stats["handled"] == 1)
+    assert failures == 2 and not run.task.done()
+
+
+def test_only_the_exact_bare_exception_counts_as_closed() -> None:
+    from orderly.broker import closed_without_reason
+
+    assert closed_without_reason(Exception())
+    assert not closed_without_reason(Exception("a real error"))
+    assert not closed_without_reason(ValueError())
