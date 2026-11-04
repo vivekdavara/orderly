@@ -45,6 +45,11 @@ HEALTH_TIMEOUT = 2.0
 # Relay.publish_timeout, 5 s each), so a stop never cancels a batch between publishing and marking it: at 10 s, equal
 # to the confirm wait then, it did (day-2 review). A test checks the margin.
 STOP_TIMEOUT = 30.0
+# The longest a request, a relay batch or a handler may wait for a pooled connection. A relay batch's other
+# bounded waits (the channel's open 5 s, two table-lock waits 5 s each, the confirms 5 s) come to 20 s, and
+# shutdown keeps 5 s of margin on top: a longer pool timeout would let a stop cancel a batch between publish and
+# mark (day 2's carry-over, refused at startup since day 3). A test checks the sum.
+MAX_POOL_TIMEOUT = 5.0
 # The module whose create_app builds each service's app.
 BUILDERS = {
     "orders": "orderly.orders",
@@ -65,6 +70,15 @@ class Settings:
     # The database pool: its size, and how long a request waits for a connection before it is refused with 503.
     pool_size: int = 10
     pool_timeout: float = 5.0
+
+    def __post_init__(self) -> None:
+        if self.pool_size < 1:
+            raise ValueError(f"pool_size must be at least 1, not {self.pool_size}")
+        if not 0 < self.pool_timeout <= MAX_POOL_TIMEOUT:
+            raise ValueError(
+                f"pool_timeout must be above 0 and at most {MAX_POOL_TIMEOUT} s (shutdown's margin counts on it),"
+                f" not {self.pool_timeout}"
+            )
 
     @classmethod
     def from_environment(cls, service: str) -> Settings:

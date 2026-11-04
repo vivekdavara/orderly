@@ -109,7 +109,7 @@ ORDERLY_PROVIDER_LATENCY_MS=50 ORDERLY_PROVIDER_DECLINE_RATIO=0.1 .venv/bin/pyth
 ```
 
 Settings: `ORDERLY_<SERVICE>_DATABASE_URL`, `ORDERLY_AMQP_URL`, `ORDERLY_POOL_SIZE` (10), `ORDERLY_POOL_TIMEOUT_S`
-(5), `ORDERLY_PAYMENT_TIMEOUT_S` (30, the order service's payment deadline), and the fake provider's
+(5, at most 5), `ORDERLY_PAYMENT_TIMEOUT_S` (30, the order service's payment deadline), and the fake provider's
 `ORDERLY_PROVIDER_LATENCY_MS`, `ORDERLY_PROVIDER_DECLINE_RATIO`, `ORDERLY_PROVIDER_ERROR_RATIO` (0), and the fake
 mailer's `ORDERLY_MAILER_LATENCY_MS`, `ORDERLY_MAILER_FAILURE_RATIO` (0).
 
@@ -438,10 +438,9 @@ connection and with the lock already held, `-1` really meaning no limit, cleanup
   it: a stuck row is for an alert to catch, and there is no alerting here.
 - A batch's claim transaction stays open while it waits for confirms (5 s at most), so a server with
   `idle_in_transaction_session_timeout` under that would end it and the batch would be published again.
-- Shutdown waits 30 s for a batch, which outwaits every bounded wait of one with the defaults (a pooled connection 5 s,
-  the channel's open 5 s, two table-lock waits 5 s each, the confirms 5 s). `ORDERLY_POOL_TIMEOUT_S` above 10 s would
-  break that margin, and the cancel could then land between publish and mark: that re-sends a batch (at least once
-  still holds), it never loses one.
+- Shutdown waits 30 s for a batch, which outwaits every bounded wait of one (a pooled connection 5 s, the channel's
+  open 5 s, two table-lock waits 5 s each, the confirms 5 s). A longer `ORDERLY_POOL_TIMEOUT_S` would break that
+  margin, so since day 3 a service refuses to start with one above 5 s (or with 0).
 - `last_error` is capped at 1,000 characters by a CHECK on `length()`, which counts characters in a UTF-8 database (all
   of Orderly's) but bytes in a SQL_ASCII one.
 - The relay doesn't promise a global order across orders (ids are taken before commit); nothing relies on one.

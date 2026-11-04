@@ -269,3 +269,23 @@ def test_shutdown_waits_longer_than_any_relay_batch_can_last() -> None:
     # table locks, the confirms.
     longest_batch = Settings("orders", "", "").pool_timeout + publish_timeout + 2 * lock_timeout + publish_timeout
     assert longest_batch + 5 <= service.STOP_TIMEOUT
+    # And with the longest pool timeout Settings accepts.
+    assert service.MAX_POOL_TIMEOUT + publish_timeout + 2 * lock_timeout + publish_timeout + 5 <= service.STOP_TIMEOUT
+
+
+@pytest.mark.parametrize("value", ["6", "10", "0", "-1"])
+def test_a_pool_timeout_that_breaks_the_stop_margin_is_refused(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    """Day 2's carry-over: ORDERLY_POOL_TIMEOUT_S above 10 s made a batch outlast shutdown's 30 s; now anything above
+    5 s (the margin the relay's test keeps) is refused when the service starts, as is a pool timeout of 0 or less."""
+    monkeypatch.setenv("ORDERLY_POOL_TIMEOUT_S", value)
+    with pytest.raises(ValueError, match=r"pool_timeout must be above 0 and at most 5\.0 s"):
+        Settings.from_environment("orders")
+
+
+def test_the_pool_settings_accept_their_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ORDERLY_POOL_TIMEOUT_S", "5")
+    monkeypatch.setenv("ORDERLY_POOL_SIZE", "1")
+    settings = Settings.from_environment("orders")
+    assert (settings.pool_timeout, settings.pool_size) == (5.0, 1)
+    with pytest.raises(ValueError, match="pool_size must be at least 1"):
+        Settings("orders", "", "", pool_size=0)
