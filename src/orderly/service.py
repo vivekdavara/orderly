@@ -45,8 +45,13 @@ HEALTH_TIMEOUT = 2.0
 # Relay.publish_timeout, 5 s each), so a stop never cancels a batch between publishing and marking it: at 10 s, equal
 # to the confirm wait then, it did (day-2 review). A test checks the margin.
 STOP_TIMEOUT = 30.0
-# The module whose create_app builds each service's app; the others are the bare skeleton until they have one.
-BUILDERS = {"orders": "orderly.orders", "payments": "orderly.payments", "monolith": "orderly.monolith"}
+# The module whose create_app builds each service's app.
+BUILDERS = {
+    "orders": "orderly.orders",
+    "payments": "orderly.payments",
+    "notifications": "orderly.notifications",
+    "monolith": "orderly.monolith",
+}
 
 log = logging.getLogger(__name__)
 
