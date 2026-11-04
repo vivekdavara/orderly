@@ -79,13 +79,21 @@ class Consumer:
     # The most a handler's transaction may take (its waits for a connection, for locks, for the provider); then it
     # fails and is retried. It also bounds how long a stop waits for the handlers in flight.
     handler_timeout: float = 10.0
-    # How long opening a channel and publishing a retry may take.
+    # How long publishing a retry may take (part of a handler's time, so of the drain's).
     publish_timeout: float = 5.0
+    # How long each of the channel's own calls may take: the open, the subscription (qos, queue, consume), the
+    # cancel and the close. All bounded, so a stop has a bound (stop_bound) inside service.STOP_TIMEOUT (day-3
+    # review, round 2).
+    control_timeout: float = 2.0
     # What happened to each delivery: handled, duplicate, retried, dead_lettered (tests and logs read it).
     stats: Counter[str] = field(default_factory=Counter)
     _inflight: set[asyncio.Task[None]] = field(default_factory=set, init=False, repr=False)
     # The channel it consumes on, which also publishes the retries (confirms and returns on).
     _channel: AbstractChannel | None = field(default=None, init=False, repr=False)
+    # Set once a stop has begun (or the channel is lost): deliveries arriving then start no handler. A cancel that timed
+    # out leaves the subscription live, and a handler started after the drain began outlived the stop (day-3 review,
+    # round 2).
+    _stopping: bool = field(default=False, init=False, repr=False)
 
     async def run(self, stop: asyncio.Event) -> None:
         """Consume until `stop` is set; after a lost channel or connection, back off and subscribe again."""
@@ -114,7 +122,7 @@ class Consumer:
         if self.connection.is_closed:
             raise ConnectionError("the broker connection is closed")
         try:
-            async with asyncio.timeout(self.publish_timeout):
+            async with asyncio.timeout(self.control_timeout):
                 # Confirms and returns on: the channel also publishes the retries.
                 return await broker.open_channel(self.connection)
         except RuntimeError as error:  # a robust connection reconnecting (see outbox.Relay._open_channel)
@@ -122,6 +130,7 @@ class Consumer:
 
     async def _consume_until(self, stop: asyncio.Event) -> None:
         channel = self._channel = await self._open_channel()
+        self._stopping = False
         # Set by every close of the channel underneath, a lost connection's included. A robust channel reopens itself
         # after a reconnect and then reports itself open again, but without this subscription (get_queue doesn't
         # register the queue for restoring): watching is_closed alone, the consumer missed a broker drop and never
@@ -134,9 +143,10 @@ class Consumer:
         channel.close_callbacks.add(on_close)
         try:
             try:
-                await channel.set_qos(prefetch_count=self.prefetch)
-                queue = await channel.get_queue(self.topology.queue(self.queue), ensure=False)
-                tag = await queue.consume(self._on_delivery)
+                async with asyncio.timeout(self.control_timeout):
+                    await channel.set_qos(prefetch_count=self.prefetch)
+                    queue = await channel.get_queue(self.topology.queue(self.queue), ensure=False)
+                    tag = await queue.consume(self._on_delivery)
             except RuntimeError as error:
                 # aiormq's ChannelInvalidStateError ("<Channel> closed") is a RuntimeError, not an AMQPError: a channel
                 # the broker closed between the open and the subscription killed the consumer for good (day-3
@@ -144,36 +154,46 @@ class Consumer:
                 raise ConnectionError(f"the channel closed before the subscription: {error}") from error
             while not stop.is_set() and not lost.is_set() and not channel.is_closed:
                 await wait_any(stop, lost, timeout=0.5)
+            self._stopping = True
             if not lost.is_set() and not channel.is_closed:
                 # No new deliveries; the ones in flight still finish and acknowledge. Bounded, like the close below:
                 # a broker that stops answering mustn't hold a shutdown past service.STOP_TIMEOUT (see stop_bound).
                 # RuntimeError: the channel closed after the check (ChannelInvalidStateError); the drain must still run.
                 with contextlib.suppress(aio_pika.exceptions.AMQPError, ConnectionError, TimeoutError, RuntimeError):
-                    async with asyncio.timeout(self.publish_timeout):
+                    async with asyncio.timeout(self.control_timeout):
                         await queue.cancel(tag)
             await self._drain()
         finally:
+            self._stopping = True
             with contextlib.suppress(aio_pika.exceptions.AMQPError, ConnectionError, RuntimeError, TimeoutError):
-                async with asyncio.timeout(self.publish_timeout):
+                async with asyncio.timeout(self.control_timeout):
                     await channel.close()
         if not stop.is_set():
             raise ConnectionError("the consumer's channel closed")
 
     @property
     def stop_bound(self) -> float:
-        """The longest a stop can take once `stop` is set: the cancel, the handlers in flight, the close."""
-        return self.publish_timeout + self._drain_timeout + self.publish_timeout
+        """The longest a stop can take once `stop` is set: the open and the subscription it may be in the middle of
+        (the stop is seen after them), the cancel, the handlers in flight, the close."""
+        return 4 * self.control_timeout + self._drain_timeout
 
     @property
     def _drain_timeout(self) -> float:
         return self.handler_timeout + self.publish_timeout + 1
 
     async def _drain(self) -> None:
-        """Wait for the handlers in flight; they are each bounded by handler_timeout and a publish."""
-        if self._inflight:
-            await asyncio.wait(set(self._inflight), timeout=self._drain_timeout)
+        """Wait for the handlers in flight; they are each bounded by handler_timeout and a publish. None starts once the
+        stop has begun (`_stopping`), but wait for the set as it is, not a snapshot, to be sure."""
+        deadline = asyncio.get_running_loop().time() + self._drain_timeout
+        while self._inflight and (left := deadline - asyncio.get_running_loop().time()) > 0:
+            await asyncio.wait(set(self._inflight), timeout=left)
 
     async def _on_delivery(self, incoming: AbstractIncomingMessage) -> None:
+        if self._stopping:
+            # A delivery after the stop began (the cancel timed out, or crossed it): start nothing the stop wouldn't
+            # wait for. Left unacknowledged, it goes back to the queue when the channel closes (counted once toward
+            # the delivery limit); a requeue here would come straight back to this live subscription, in a loop.
+            return
         # In a task of our own rather than aiormq's: closing a channel cancels aiormq's consumer tasks, and a stop must
         # let a handler that has committed acknowledge.
         task = asyncio.create_task(self.process(incoming), name=f"{self.name}:{incoming.delivery_tag}")
@@ -260,7 +280,8 @@ class Consumer:
             log.warning("consumer %s: could not schedule a retry (%r); closing the channel", self.name, failure)
             if channel is not None:
                 with contextlib.suppress(Exception):
-                    await channel.close()
+                    async with asyncio.timeout(self.control_timeout):
+                        await channel.close()
             return
         self.stats["retried"] += 1
         await incoming.ack()

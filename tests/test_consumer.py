@@ -365,7 +365,8 @@ def test_a_stop_fits_inside_the_services_stop_timeout() -> None:
         handle=Toy(),
         accepts=frozenset(),
     )
-    assert consumer.stop_bound == 5 + 16 + 5
+    # The open, the subscription, the cancel and the close at 2 s each, and the drain: handler 10 + retry publish 5 + 1.
+    assert consumer.stop_bound == 4 * 2 + 16
     assert consumer.stop_bound < STOP_TIMEOUT
 
 
@@ -376,7 +377,7 @@ async def test_a_broker_that_never_answers_the_cancel_does_not_hold_the_stop(
         await asyncio.Event().wait()
 
     monkeypatch.setattr(aio_pika.queue.Queue, "cancel", never)
-    run = await start(Toy(), publish_timeout=0.3)
+    run = await start(Toy(), control_timeout=0.3)
     await asyncio.sleep(0.3)  # subscribed
     started = time.monotonic()
     await run.finish()
@@ -405,3 +406,27 @@ async def test_a_cancel_on_a_channel_closed_under_it_still_drains_the_handlers(
     await run.finish()  # raises if the RuntimeError escaped run
     assert run.consumer.stats["handled"] == 1
     assert effects(fresh_database) == [(message.message_id, 2599)]
+
+
+async def test_a_broker_that_never_answers_the_close_does_not_hold_the_stop(
+    start: Start, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The day-3 review's (round 2) surviving mutant: nothing tested the close's bound."""
+    from orderly import broker
+
+    real = broker.open_channel
+
+    async def never(*_: object, **__: object) -> None:
+        await asyncio.Event().wait()
+
+    async def unclosable(connection: AbstractConnection) -> AbstractChannel:
+        opened = await real(connection)
+        monkeypatch.setattr(opened, "close", never)
+        return opened
+
+    monkeypatch.setattr(broker, "open_channel", unclosable)
+    run = await start(Toy(), control_timeout=0.3)
+    await asyncio.sleep(0.3)  # subscribed
+    started = time.monotonic()
+    await run.finish()
+    assert time.monotonic() - started < 3

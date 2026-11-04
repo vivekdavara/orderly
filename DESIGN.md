@@ -452,8 +452,10 @@ outbox never does) can't send two e-mails.
   requeued, since RabbitMQ 4 doesn't count requeues toward the delivery limit. If the broker can't take the copy, the
   consumer closes its channel instead of acknowledging, so the delivery comes back counted toward the limit.
 - A stop cancels the subscription, waits for the handlers in flight (each bounded by its timeout), then closes the
-  channel; the cancel and the close are bounded too, so a stop takes at most `stop_bound` (5 + 16 + 5 = 26 s), inside
-  the services' 30 s `STOP_TIMEOUT`.
+  channel. Each of the channel's own calls (the open, the subscription, the cancel, the close) is bounded by
+  `control_timeout` (2 s), so a stop takes at most `stop_bound` (4 × 2 + 16 = 24 s), inside the services' 30 s
+  `STOP_TIMEOUT`; once a stop has begun, a delivery starts no handler (a cancel that timed out leaves the subscription
+  live): it is left unacknowledged and goes back to the queue with the channel (day-3 review, round 2).
 - A `RuntimeError` from the subscription steps (aiormq's `ChannelInvalidStateError` for a channel the broker has
   closed) is a broker failure: back off and subscribe again (day-3 review: it ended the consumer for good).
 - After any close of its channel (a broker drop included) the consumer closes the channel for good and subscribes on a
