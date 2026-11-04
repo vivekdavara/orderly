@@ -728,3 +728,31 @@ async def test_a_channel_that_never_opens_times_out(
         await task
     assert time.perf_counter() - started < 2.0
     assert await unpublished(pool) == 1
+
+
+async def test_a_bare_exception_from_the_broker_client_does_not_kill_the_relay(
+    pool: AsyncConnectionPool, topology: Topology, connection: AbstractConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """aiormq's bare Exception() for a call pending on a connection closed without a reason (day 3): an outage."""
+    real = broker.open_channel
+    failures = 0
+
+    async def closed_under_us(conn: AbstractConnection) -> AbstractChannel:
+        nonlocal failures
+        if failures < 2:
+            failures += 1
+            raise Exception()
+        return await real(conn)
+
+    monkeypatch.setattr(broker, "open_channel", closed_under_us)
+    await write_all(pool, [charge()])
+    stop = asyncio.Event()
+    task = asyncio.create_task(relay(pool, connection, topology, poll_interval=0.05).run(stop))
+    deadline = time.monotonic() + 10
+    while await unpublished(pool) != 0:
+        assert not task.done(), task
+        assert time.monotonic() < deadline
+        await asyncio.sleep(0.02)
+    stop.set()
+    await asyncio.wait_for(task, 10)
+    assert failures == 2

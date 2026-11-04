@@ -224,6 +224,13 @@ class Relay:
                     await wait_any(stop, timeout=backoff)
                     backoff = min(backoff * 2, MAX_BACKOFF)
                     continue
+                except Exception as error:
+                    if not broker.closed_without_reason(error):
+                        raise
+                    log.warning("outbox relay: the broker closed a call (%r); retrying in %.1f s", error, backoff)
+                    await wait_any(stop, timeout=backoff)
+                    backoff = min(backoff * 2, MAX_BACKOFF)
+                    continue
                 backoff = MIN_BACKOFF
                 if claimed < self.batch_size:  # a full batch probably means more are waiting
                     await wait_any(stop, wake, timeout=self.poll_interval)
