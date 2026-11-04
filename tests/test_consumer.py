@@ -347,3 +347,36 @@ def test_only_the_exact_bare_exception_counts_as_closed() -> None:
     assert closed_without_reason(Exception())
     assert not closed_without_reason(Exception("a real error"))
     assert not closed_without_reason(ValueError())
+
+
+def test_a_stop_fits_inside_the_services_stop_timeout() -> None:
+    """Shutdown cancels a worker still running after service.STOP_TIMEOUT; a consumer's own stop (the cancel, the
+    handlers in flight, the close, each bounded) must end well before, or a handler could be cut off after its
+    commit."""
+    from orderly.service import STOP_TIMEOUT
+
+    consumer = Consumer(
+        pool=None,  # type: ignore[arg-type]
+        connection=None,  # type: ignore[arg-type]
+        topology=Topology(),
+        queue="payment.commands",
+        name="bound",
+        handle=Toy(),
+        accepts=frozenset(),
+    )
+    assert consumer.stop_bound == 5 + 16 + 5
+    assert consumer.stop_bound < STOP_TIMEOUT
+
+
+async def test_a_broker_that_never_answers_the_cancel_does_not_hold_the_stop(
+    start: Start, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def never(*_: object, **__: object) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(aio_pika.queue.Queue, "cancel", never)
+    run = await start(Toy(), publish_timeout=0.3)
+    await asyncio.sleep(0.3)  # subscribed
+    started = time.monotonic()
+    await run.finish()
+    assert time.monotonic() - started < 3

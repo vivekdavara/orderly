@@ -139,19 +139,32 @@ class Consumer:
             while not stop.is_set() and not lost.is_set() and not channel.is_closed:
                 await wait_any(stop, lost, timeout=0.5)
             if not lost.is_set() and not channel.is_closed:
-                with contextlib.suppress(aio_pika.exceptions.AMQPError, ConnectionError):
-                    await queue.cancel(tag)  # no new deliveries; the ones in flight still finish and acknowledge
+                # No new deliveries; the ones in flight still finish and acknowledge. Bounded, like the close below:
+                # a broker that stops answering mustn't hold a shutdown past service.STOP_TIMEOUT (see stop_bound).
+                with contextlib.suppress(aio_pika.exceptions.AMQPError, ConnectionError, TimeoutError):
+                    async with asyncio.timeout(self.publish_timeout):
+                        await queue.cancel(tag)
             await self._drain()
         finally:
-            with contextlib.suppress(aio_pika.exceptions.AMQPError, ConnectionError, RuntimeError):
-                await channel.close()
+            with contextlib.suppress(aio_pika.exceptions.AMQPError, ConnectionError, RuntimeError, TimeoutError):
+                async with asyncio.timeout(self.publish_timeout):
+                    await channel.close()
         if not stop.is_set():
             raise ConnectionError("the consumer's channel closed")
+
+    @property
+    def stop_bound(self) -> float:
+        """The longest a stop can take once `stop` is set: the cancel, the handlers in flight, the close."""
+        return self.publish_timeout + self._drain_timeout + self.publish_timeout
+
+    @property
+    def _drain_timeout(self) -> float:
+        return self.handler_timeout + self.publish_timeout + 1
 
     async def _drain(self) -> None:
         """Wait for the handlers in flight; they are each bounded by handler_timeout and a publish."""
         if self._inflight:
-            await asyncio.wait(set(self._inflight), timeout=self.handler_timeout + self.publish_timeout + 1)
+            await asyncio.wait(set(self._inflight), timeout=self._drain_timeout)
 
     async def _on_delivery(self, incoming: AbstractIncomingMessage) -> None:
         # In a task of our own rather than aiormq's: closing a channel cancels aiormq's consumer tasks, and a stop must
