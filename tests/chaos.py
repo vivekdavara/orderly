@@ -26,6 +26,9 @@ class Proxy:
     # Connections accepted (the clients' reconnects included), and how many a cut dropped.
     accepted: int = 0
     dropped: int = 0
+    # Bumped by every cut: a connection accepted before a cut whose upstream connect finishes after it is dropped too
+    # (day-4 review: it went on talking to the "unreachable" broker).
+    _cuts: int = field(default=0, init=False, repr=False)
     _server: asyncio.Server | None = field(default=None, init=False, repr=False)
     _links: set[tuple[asyncio.StreamWriter, asyncio.StreamWriter]] = field(default_factory=set, init=False, repr=False)
     _tasks: set[asyncio.Task[None]] = field(default_factory=set, init=False, repr=False)
@@ -47,7 +50,9 @@ class Proxy:
         return urlunsplit(parts._replace(netloc=netloc))
 
     async def cut(self) -> None:
-        """Stop listening and drop every connection through the proxy, both ways, without a goodbye."""
+        """Stop listening and drop every connection through the proxy, both ways, without a goodbye: those linked and
+        those still connecting upstream."""
+        self._cuts += 1
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -70,10 +75,16 @@ class Proxy:
 
     async def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.accepted += 1
+        cuts = self._cuts
         try:
             up_reader, up_writer = await asyncio.open_connection(self.target_host, self.target_port)
         except OSError:
             writer.transport.abort()
+            return
+        if self._cuts != cuts:  # cut while connecting upstream: dropped like the rest
+            up_writer.transport.abort()
+            writer.transport.abort()
+            self.dropped += 1
             return
         link = (writer, up_writer)
         self._links.add(link)
