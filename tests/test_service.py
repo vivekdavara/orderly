@@ -12,7 +12,7 @@ from helpers import running
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from orderly import service
-from orderly.broker import amqp_url
+from orderly.broker import amqp_url, robust_url
 from orderly.migrate import Migration, MigrationError, migrate, migrations
 from orderly.service import PORTS, Resources, Settings, create_app
 from orderly.topology import Topology
@@ -309,3 +309,12 @@ def test_a_topology_prefix_with_odd_characters_is_refused(monkeypatch: pytest.Mo
     monkeypatch.setenv("ORDERLY_TOPOLOGY_PREFIX", value)
     with pytest.raises(ValueError, match="ORDERLY_TOPOLOGY_PREFIX must be"):
         Settings.from_environment("orders")
+
+
+def test_a_service_reconnects_every_second_unless_its_url_says_otherwise() -> None:
+    """aio-pika's robust connection waits 5 s between attempts by default; the services' URL asks for 1 s (day 4's
+    broker outage: the broker was back 4.2 s before the services tried again). A URL's own setting wins."""
+    assert robust_url("amqp://guest:guest@127.0.0.1:5673/") == "amqp://guest:guest@127.0.0.1:5673/?reconnect_interval=1"
+    assert robust_url("amqp://h:5672/?heartbeat=30") == "amqp://h:5672/?heartbeat=30&reconnect_interval=1"
+    assert robust_url("amqp://h:5672/?reconnect_interval=0.5") == "amqp://h:5672/?reconnect_interval=0.5"
+    assert robust_url("amqp://h:5672/", 0.25) == "amqp://h:5672/?reconnect_interval=0.25"

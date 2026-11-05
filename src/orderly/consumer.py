@@ -47,6 +47,8 @@ Handler = Callable[[Connection, Message], Awaitable[None]]
 
 MIN_BACKOFF = 0.1
 MAX_BACKOFF = 5.0
+# What losing the broker looks like from a subscription (CancelledError: see run).
+BROKER_ERRORS = (aio_pika.exceptions.AMQPError, ConnectionError, OSError, TimeoutError, asyncio.CancelledError)
 
 log = logging.getLogger(__name__)
 
@@ -97,26 +99,29 @@ class Consumer:
 
     async def run(self, stop: asyncio.Event) -> None:
         """Consume until `stop` is set; after a lost channel or connection, back off and subscribe again."""
-        backoff = MIN_BACKOFF
-        while not stop.is_set():
-            try:
-                await self._consume_until(stop)
-                backoff = MIN_BACKOFF
-            except (aio_pika.exceptions.AMQPError, ConnectionError, OSError, TimeoutError, asyncio.CancelledError) as e:
-                # aiormq raises CancelledError into an RPC's caller when the connection closes under it (the relay found
-                # this on day 2): only a real cancel of this task ends it.
-                current = asyncio.current_task()
-                if isinstance(e, asyncio.CancelledError) and current is not None and current.cancelling():
-                    raise
-                log.warning("consumer %s: %r; subscribing again in %.1f s", self.name, e, backoff)
-                await wait_any(stop, timeout=backoff)
-                backoff = min(backoff * 2, MAX_BACKOFF)
-            except Exception as error:
-                if not broker.closed_without_reason(error):
-                    raise
-                log.warning("consumer %s: the broker closed a call (%r); subscribing again", self.name, error)
-                await wait_any(stop, timeout=backoff)
-                backoff = min(backoff * 2, MAX_BACKOFF)
+        with broker.reconnects(self.connection) as reconnected:
+            backoff = MIN_BACKOFF
+            while not stop.is_set():
+                # A reconnect from now on means the broker is back: a backoff for an outage ends then (day 4).
+                reconnected.clear()
+                try:
+                    await self._consume_until(stop)
+                    backoff = MIN_BACKOFF
+                except BROKER_ERRORS as e:
+                    # aiormq raises CancelledError into an RPC's caller when the connection closes under it (the relay
+                    # found this on day 2): only a real cancel of this task ends it.
+                    current = asyncio.current_task()
+                    if isinstance(e, asyncio.CancelledError) and current is not None and current.cancelling():
+                        raise
+                    log.warning("consumer %s: %r; subscribing again in %.1f s", self.name, e, backoff)
+                    await wait_any(stop, reconnected, timeout=backoff)
+                    backoff = min(backoff * 2, MAX_BACKOFF)
+                except Exception as error:
+                    if not broker.closed_without_reason(error):
+                        raise
+                    log.warning("consumer %s: the broker closed a call (%r); subscribing again", self.name, error)
+                    await wait_any(stop, reconnected, timeout=backoff)
+                    backoff = min(backoff * 2, MAX_BACKOFF)
 
     async def _open_channel(self) -> AbstractChannel:
         if self.connection.is_closed:

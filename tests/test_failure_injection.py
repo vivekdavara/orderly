@@ -19,6 +19,7 @@ from chaos import proxy_to
 from helpers import stock_of
 from shop import Shop, open_shop
 
+from orderly import consumer, outbox
 from orderly.broker import amqp_url
 from orderly.fakes import Charge, FakeProvider, Refund
 from orderly.outbox import Relay
@@ -228,3 +229,26 @@ async def test_a_charge_whose_every_answer_was_lost_is_refunded_by_the_orders_vo
         assert inner.net_cents() == 0, "and given back"
         check_books(shop, inner, [order])
         assert "will be refunded" in shop.mailer.sent[0].body
+
+
+async def test_after_an_outage_the_workers_start_when_the_broker_is_back_not_when_their_backoff_ends(
+    databases: dict[str, str], short_topology: Topology, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every relay's and consumer's backoff pinned at 30 s: orders taken while the broker is away still settle within
+    seconds of its return, because the robust connection's reconnect wakes them. Day 4's load test found the services
+    idle for 4.2 s after the broker came back (aio-pika's 5 s reconnect interval, then the workers' own backoff)."""
+    for module in (outbox, consumer):
+        monkeypatch.setattr(module, "MIN_BACKOFF", 30.0)
+        monkeypatch.setattr(module, "MAX_BACKOFF", 30.0)
+    provider = FakeProvider()
+    async with proxy_to(amqp_url()) as proxy:
+        url = with_query(proxy.url(amqp_url()), "reconnect_interval=0.2")
+        async with open_shop(databases, short_topology, provider, amqp=url) as shop:
+            await proxy.cut()
+            placed = await asyncio.gather(*(shop.order() for _ in range(10)))
+            await asyncio.sleep(1.0)  # every worker has failed by now and is in its 30 s backoff
+            await proxy.restore()
+            restored = time.monotonic()
+            final = await shop.settled([p["id"] for p in placed], timeout=10)
+            assert time.monotonic() - restored < 10
+            check_books(shop, provider, final)

@@ -190,54 +190,58 @@ class Relay:
         wake = asyncio.Event()
         listener = None if self.listen_url is None else asyncio.create_task(self._listen(self.listen_url, wake, stop))
         backoff = MIN_BACKOFF
-        try:
-            while not stop.is_set():
-                wake.clear()  # before the batch: a NOTIFY while it runs means another pass
-                try:
-                    claimed = await self.publish_batch()
-                except RelayError as error:
-                    if error.broker:  # the broker's failure: back off as for an outage (below)
-                        log.warning("outbox relay: %s; retrying in %.1f s", error, backoff)
-                        await wait_any(stop, timeout=backoff)
+        with broker.reconnects(self.connection) as reconnected:
+            try:
+                while not stop.is_set():
+                    wake.clear()  # before the batch: a NOTIFY while it runs means another pass
+                    # And a reconnect from now on means the broker is back: a backoff for an outage ends then (day 4).
+                    reconnected.clear()
+                    try:
+                        claimed = await self.publish_batch()
+                    except RelayError as error:
+                        if error.broker:  # the broker's failure: back off as for an outage (below)
+                            log.warning("outbox relay: %s; retrying in %.1f s", error, backoff)
+                            await wait_any(stop, reconnected, timeout=backoff)
+                            backoff = min(backoff * 2, MAX_BACKOFF)
+                            continue
+                        # Only rows that failed on their own, and wait for their own retries: nothing is wrong with the
+                        # relay, so no backoff (it held every other message up for up to 5 s: day-2 review).
+                        log.warning("outbox relay: %s", error)
+                        claimed = error.published + len(error.failed)
+                    except (
+                        psycopg.Error,
+                        PoolTimeout,
+                        aio_pika.exceptions.AMQPError,
+                        ConnectionError,
+                        OSError,
+                        TimeoutError,
+                        asyncio.CancelledError,
+                    ) as error:
+                        # aiormq raises CancelledError into whoever awaits an RPC when the connection closes under it
+                        # (opening a channel, a confirm), though nobody cancelled this task: found when a service's
+                        # broker closed while its relay opened a channel, and the relay died. Only a real cancel ends
+                        # it.
+                        current = asyncio.current_task()
+                        if isinstance(error, asyncio.CancelledError) and current is not None and current.cancelling():
+                            raise
+                        log.warning("outbox relay: %r; retrying in %.1f s", error, backoff)
+                        await wait_any(stop, reconnected, timeout=backoff)
                         backoff = min(backoff * 2, MAX_BACKOFF)
                         continue
-                    # Only rows that failed on their own, and wait for their own retries: nothing is wrong with the
-                    # relay, so no backoff (it held every other message up for up to 5 s: day-2 review).
-                    log.warning("outbox relay: %s", error)
-                    claimed = error.published + len(error.failed)
-                except (
-                    psycopg.Error,
-                    PoolTimeout,
-                    aio_pika.exceptions.AMQPError,
-                    ConnectionError,
-                    OSError,
-                    TimeoutError,
-                    asyncio.CancelledError,
-                ) as error:
-                    # aiormq raises CancelledError into whoever awaits an RPC when the connection closes under it
-                    # (opening a channel, a confirm), though nobody cancelled this task: found when a service's
-                    # broker closed while its relay opened a channel, and the relay died. Only a real cancel ends it.
-                    current = asyncio.current_task()
-                    if isinstance(error, asyncio.CancelledError) and current is not None and current.cancelling():
-                        raise
-                    log.warning("outbox relay: %r; retrying in %.1f s", error, backoff)
-                    await wait_any(stop, timeout=backoff)
-                    backoff = min(backoff * 2, MAX_BACKOFF)
-                    continue
-                except Exception as error:
-                    if not broker.closed_without_reason(error):
-                        raise
-                    log.warning("outbox relay: the broker closed a call (%r); retrying in %.1f s", error, backoff)
-                    await wait_any(stop, timeout=backoff)
-                    backoff = min(backoff * 2, MAX_BACKOFF)
-                    continue
-                backoff = MIN_BACKOFF
-                if claimed < self.batch_size:  # a full batch probably means more are waiting
-                    await wait_any(stop, wake, timeout=self.poll_interval)
-        finally:
-            if listener is not None:
-                listener.cancel()
-                await asyncio.gather(listener, return_exceptions=True)
+                    except Exception as error:
+                        if not broker.closed_without_reason(error):
+                            raise
+                        log.warning("outbox relay: the broker closed a call (%r); retrying in %.1f s", error, backoff)
+                        await wait_any(stop, reconnected, timeout=backoff)
+                        backoff = min(backoff * 2, MAX_BACKOFF)
+                        continue
+                    backoff = MIN_BACKOFF
+                    if claimed < self.batch_size:  # a full batch probably means more are waiting
+                        await wait_any(stop, wake, timeout=self.poll_interval)
+            finally:
+                if listener is not None:
+                    listener.cancel()
+                    await asyncio.gather(listener, return_exceptions=True)
 
     async def _listen(self, url: str, wake: asyncio.Event, stop: asyncio.Event) -> None:
         """Set `wake` on every NOTIFY for this outbox's schema; reconnect after a lost connection (polling covers the

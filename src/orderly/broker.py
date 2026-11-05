@@ -5,7 +5,11 @@ The outbox relay (day 2) is the only caller in the services; tests use it direct
 
 from __future__ import annotations
 
+import asyncio
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from urllib.parse import parse_qsl, urlsplit
 
 import aio_pika
 from aio_pika.abc import AbstractChannel, AbstractConnection, AbstractIncomingMessage
@@ -17,8 +21,42 @@ from orderly.topology import Topology
 DEFAULT_URL = "amqp://guest:guest@127.0.0.1:5673/"
 
 
+# How often a service's robust connection tries the broker again after losing it. aio-pika's default is 5 s, which
+# a broker outage in the load test (day 4) showed: the broker was back 4.2 s before the services noticed.
+RECONNECT_INTERVAL = 1.0
+
+
 def amqp_url() -> str:
     return os.environ.get("ORDERLY_AMQP_URL", DEFAULT_URL)
+
+
+def robust_url(url: str, interval: float = RECONNECT_INTERVAL) -> str:
+    """`url` with aio-pika's `reconnect_interval` set to `interval`, unless the URL sets its own."""
+    if any(key == "reconnect_interval" for key, _ in parse_qsl(urlsplit(url).query)):
+        return url
+    return f"{url}{'&' if urlsplit(url).query else '?'}reconnect_interval={interval:g}"
+
+
+@contextmanager
+def reconnects(connection: AbstractConnection) -> Iterator[asyncio.Event]:
+    """An event set each time `connection` (a robust one) has reconnected and restored its channels.
+
+    A worker backing off after a broker outage waits for it as well as for its backoff, so it starts again when the
+    broker is back rather than when its backoff ends (up to 5 s later: day 4's load test). A plain connection never
+    reconnects, so its event is never set."""
+    event = asyncio.Event()
+
+    def reconnected(*_: object) -> None:
+        event.set()
+
+    callbacks = getattr(connection, "reconnect_callbacks", None)
+    if callbacks is not None:
+        callbacks.add(reconnected)
+    try:
+        yield event
+    finally:
+        if callbacks is not None:
+            callbacks.discard(reconnected)
 
 
 def to_amqp(message: Message) -> aio_pika.Message:

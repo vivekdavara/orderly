@@ -33,7 +33,7 @@ from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse
 from psycopg_pool import AsyncConnectionPool
 
-from orderly.broker import amqp_url
+from orderly.broker import amqp_url, robust_url
 from orderly.config import SERVICES, WITH_OUTBOX, WITHOUT_BROKER, database_url
 from orderly.migrate import migrate, migrations
 from orderly.topology import Topology
@@ -139,7 +139,7 @@ async def _broker(settings: Settings) -> AsyncIterator[AbstractRobustConnection 
     if settings.service in WITHOUT_BROKER:
         yield None
         return
-    broker = await aio_pika.connect_robust(settings.amqp_url)
+    broker = await aio_pika.connect_robust(robust_url(settings.amqp_url))
     try:
         async with broker.channel() as channel:
             await settings.topology.declare(channel)
