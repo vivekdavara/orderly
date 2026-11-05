@@ -117,7 +117,8 @@ ORDERLY_PROVIDER_LATENCY_MS=50 ORDERLY_PROVIDER_DECLINE_RATIO=0.1 .venv/bin/pyth
 
 Settings: `ORDERLY_<SERVICE>_DATABASE_URL`, `ORDERLY_AMQP_URL` (the services add `reconnect_interval=1` unless it
 sets one), `ORDERLY_TOPOLOGY_PREFIX` (none; the load test's own topology), `ORDERLY_POOL_SIZE` (10),
-`ORDERLY_POOL_TIMEOUT_S` (5, at most 5), `ORDERLY_PAYMENT_TIMEOUT_S` (30, the order service's payment deadline), and the fake provider's
+`ORDERLY_POOL_TIMEOUT_S` (5, at most 5), `ORDERLY_MAX_AWAITING_PAYMENT` (none: the cap on orders awaiting payment,
+503 above it), `ORDERLY_PAYMENT_TIMEOUT_S` (30, the order service's payment deadline), and the fake provider's
 `ORDERLY_PROVIDER_LATENCY_MS`, `ORDERLY_PROVIDER_DECLINE_RATIO`, `ORDERLY_PROVIDER_ERROR_RATIO` (0), and the fake
 mailer's `ORDERLY_MAILER_LATENCY_MS`, `ORDERLY_MAILER_FAILURE_RATIO` (0).
 
@@ -135,8 +136,8 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 616 tests in about 2 minutes here (128-132 s for the pytest part on day 4; 120.5 s for day 3's
-516, 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 4's (85 new):
+`make check` runs 625 tests in about 2 minutes here (124-132 s for the pytest part on day 4; 120.5 s for day 3's
+516, 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 4's (94 new):
 
 - **Contracts** (68, `tests/test_contracts.py`, `contracts/*.json`): 11 interactions, each checked as a contract (well
   formed; the example a canonical message, valid by the published JSON Schema; routed to its consumer and in its
@@ -150,9 +151,15 @@ Erlang distribution (25673) and epmd to loopback.
   every worker's backoff pinned at 30 s and the orders still settling within seconds of the broker's return. Each ends
   with the books. Disabling the consumer's `processed_messages` check fails both duplicate tests; the old relay and
   consumer fail the last one.
-- **The load test's own arithmetic** (5, `tests/test_load_test.py`): nearest-rank percentiles in integers, the orders
+- **The awaiting cap** (3, `tests/test_orders_service.py`): past the cap a 503 with Retry-After that reserves, writes
+  and sends nothing, and an order taken again once one leaves `AWAITING_PAYMENT`; two requests with one key racing for
+  the last place both get the one order (fails 3 of 3 without the key's re-check); the setting.
+- **The load test's own arithmetic** (7, `tests/test_load_test.py`): nearest-rank percentiles in integers, the orders
   fixed by the seed and all valid requests, the summary counting only timed orders, the recovery measured from the
-  node's restart. **The skeleton** (6): `ORDERLY_TOPOLOGY_PREFIX` and its refusals; the reconnect interval.
+  node's restart, refusals counted and timed apart, the exit status. **The skeleton** (7): `ORDERLY_TOPOLOGY_PREFIX`
+  and its refusals; the reconnect interval, in the URL and on a running service's connection. **The review's** (3,
+  `tests/review_d4/`): the proxy's cut race and the contracts' envelope blind spot (each failed 3 of 3 before its
+  fix), and the open loop timed from the due times (kills three load-test mutants).
 
 Day 3's:
 
@@ -311,7 +318,32 @@ What they say:
   50 ms. The backlog grows, and 2,769 orders reach their 30 s deadline unpaid and are cancelled (`payment_timeout`):
   2,475 of them had been charged by then and were refunded, 294 declined anyway. Nobody was charged for a cancelled
   order, but a client of the split needs either backpressure (a limit on orders awaiting payment) or more payment
-  capacity; the monolith's slowness was its backpressure.
+  capacity; the monolith's slowness was its backpressure. So the order service now has one, opt-in (next).
+
+**The cap on orders awaiting payment** (`ORDERLY_MAX_AWAITING_PAYMENT`, added after the run above): the same 64
+clients against the services with at most 1,000 orders awaiting payment (16:10, commit `07addae`; load average 10.1
+at the start, with Spotlight indexing and WhatsApp each using most of a core, so its rates are lower than the run
+above's for that reason too). The first row is the run above again:
+
+```bash
+.venv/bin/python scripts/load_test.py services --orders 10000 --concurrency 64 --max-awaiting 1000 \
+    --json results/load/services-c64-cap1000.json --samples results/load/samples/services-c64-cap1000.csv
+```
+
+| Target | Loop | Sent/s | Settled/s | Accept ms p50 / p95 / p99 / max | End to end ms p50 / p95 / p99 / max | Outcomes | Books |
+|---|---|---|---|---|---|---|---|
+| services | closed, 64 clients | 359.4 | 171.0 | 106.9 / 566.3 / 1,054.0 / 4,885.9 | 20,444.8 / 31,003.8 / 31,238.3 / 31,851.4 | 6,512 confirmed, 719 declined, 2,769 timeout cancelled | agree |
+| services | closed, 64 clients | 269.2 | 136.1 | 145.9 / 931.8 / 1,848.3 / 3,913.0 | 6,961.0 / 8,071.4 / 8,347.4 / 9,106.6 | 5,386 confirmed, 624 declined cancelled; 3,990 refused (503, the cap) | agree |
+
+- **No order timed out**: 6,010 were taken and every one settled (5,386 confirmed, 624 declined), against 2,769 timed
+  out and refunded without the cap. Their end-to-end p99 was 8.3 s (31.2 s without), about what 1,000 orders ahead
+  take at 136/s.
+- **3,990 were turned away** with `503 too_many_awaiting_payment` and `Retry-After: 1`, nothing written for them.
+  Not instantly on this overloaded laptop: 112.4 ms at the median, 980.3 ms at p99 (answered - sent of the refused
+  orders, from the committed samples), about what an accepted order took to answer (145.9 ms).
+- So the split can push back like the monolith did, but only if someone picks the number: about the payment
+  service's rate times the wait you will accept, well under the deadline (here 1,000 / 136 per s, about 7 s, against
+  30 s).
 
 **A broker outage** (`--broker-outage 30 10`: `scripts/rabbitmq.sh stop` 30 s into the timed orders, `start` 10 s
 after it returned, about 14 s down in all), at 100 orders/s, before and after the day's fix:
@@ -348,6 +380,9 @@ after it returned, about 14 s down in all), at 100 orders/s, before and after th
   (38.6-39.1 s before, 30.9-31.1 s after). The end-to-end p50 in the table (1.5 s before, 64 ms after) is a threshold
   effect of the same thing, not a 20-fold speedup: in a 100 s run with a 14 s outage the median order sits right at the
   end of the catch-up.
+- The outcomes are timed when the load test's own listener receives them, and that listener reconnects too (every
+  0.5 s), so an event announced while it was reconnecting is timed late: the "first order settled" numbers are upper
+  bounds, by up to half a second (day-4 review).
 - These are two runs each on a laptop with other work running; the direction is clear, the decimals aren't.
 
 ## Results (day 3)
@@ -408,6 +443,31 @@ Measured on an Apple M3 laptop (macOS 26.6.2, on battery), PostgreSQL 14.20, Rab
 The second row is the day's most useful finding: on RabbitMQ 4, requeueing a message is "released", not "failed",
 so a consumer that requeues on a transient error would loop forever without the delivery limit ever stopping it. The
 retries (day 3) therefore never requeue: they go through wait queues with their own attempt count.
+
+## Review of day 4
+
+One review agent, in its own git worktree, read the day's code at `e2c03bf` (15:48-16:00, about 12 minutes, ~205k
+tokens) with a correctness brief, wrote each finding as a test and ran 8 mutants. Two defects, both in the day's test
+infrastructure, each test failing 3 of 3 before its fix and passing after:
+
+| Defect | Fix |
+|---|---|
+| `chaos.Proxy.cut()` aborted only connections already linked; one accepted just before a cut whose upstream connect finished after it was linked and pumped, so it went on talking to the broker the proxy called unreachable | `cut()` bumps a counter that `_accept` checks after connecting; a connection cut meanwhile is aborted both ways (`ceb2acd`, `tests/review_d4/`) |
+| The contract tests' "ignores every unlisted field" check compared what a consumer wrote as type and payload only, so a consumer stamping its reply with the command's `occurred_at` (or copying its `causation_id`) passed while its contract left those out | the written messages are compared whole: a value copied from the incoming message kept, a fresh id or time blanked (`d0617c3`) |
+
+Its suspicions: a drain that timed out was reported like one that went quiet, and the books could then say "agree".
+My own first capped run then went wrong in the same code: refused orders are never written, but the drain and the
+books expected every order sent, so it waited out its 120 s and the books said "disagree". Both fixed in `07addae`
+(they count the orders accepted, and a drain that times out fails the books), which also builds the outcome listener's URL with `robust_url`. Noted in the results: the listener's own 0.5 s reconnect
+makes "first order settled after the restart" an upper bound. Its mutants: three of the load test survived its unit
+tests (end to end from the send instead of the due time, the warm-ups kept, the send time recorded as the due time);
+its test of the open loop against a fake client (`tests/review_d4/`) kills all three. Dropping `robust_url` from the
+services' start-up survived too; `test_a_running_service_reconnects_every_second` kills it. Not acted on: the books
+compare sums (confirmed cents against charged cents, units taken against units confirmed), so two offsetting errors
+would pass; `outcomes_while_stopped` counts from the stop request, not from the node being down. What held: no lost
+or spinning wake-up in `broker.reconnects` (aio-pika calls the callback after restoring channels; the event is set
+through the attempt's error); the outage test really puts every worker in its 30 s backoff; every recovery number in
+this README recomputes from the committed samples.
 
 ## Review of day 3
 
@@ -554,6 +614,9 @@ connection and with the lock already held, `-1` really meaning no limit, cleanup
 - **Open loop, measured to the outcome event, books checked after every run**: a closed loop hides a stall as a slower
   sender; the services' "done" is the event a subscriber sees, not the 201; and a fast run that loses an order is a
   failure, so every run ends with the databases agreeing or it says so.
+- **A cap on orders awaiting payment, answered 503 with Retry-After** (day 4, opt-in): the load test showed the split
+  saying yes to everything and letting the deadline refund what it couldn't charge; a 503 tells the client at once.
+  503 rather than 429: the service is out of capacity for everyone, not limiting this client.
 - **Workers wake on the reconnect, not only on their backoff** (day 4): a backoff exists to spare a broker that's down,
   so once the connection is back there is nothing left to wait for.
 
@@ -567,10 +630,12 @@ connection and with the lock already held, `-1` really meaning no limit, cleanup
 - The payment service holds a database connection for each provider call in flight (8 at most per instance, the
   consumer's prefetch), so a slow provider limits its throughput to 8 / latency per instance: about 160 orders/s at
   50 ms (171 settled/s measured on day 4, timeouts included).
-- **No backpressure on intake**: the order service takes orders as fast as it can write them (359/s with 64 clients),
-  whatever the payment service can charge, so an overload turns into payment timeouts and refunds (2,769 of 10,000
-  orders in the day-4 closed-loop run), not into slower answers. A cap on orders awaiting payment, answered `429` or
-  `503` above it, would push back like the monolith does.
+- **Backpressure is opt-in and approximate**: without `ORDERLY_MAX_AWAITING_PAYMENT` the order service takes orders as
+  fast as it can write them (359/s with 64 clients) whatever the payment service can charge, and an overload turns
+  into payment timeouts and refunds (2,769 of 10,000 orders in the day-4 closed-loop run). With it, the count isn't
+  locked, so concurrent requests can overshoot the cap by up to the pool's size; it is checked after the stock is
+  reserved (rolled back on a refusal); and the right number depends on the payment service's rate, which nothing
+  measures for you.
 - The load test runs every process (three services, PostgreSQL, RabbitMQ, the generator) on one laptop over loopback:
   the numbers include their contention for the same cores and no network latency.
 - The outage the load test injects stops the only node; with a cluster, quorum queues would fail over instead, which

@@ -485,6 +485,7 @@ outbox never does) can't send two e-mails.
 | A charge fails all its attempts | Dead-lettered; the order times out and its refund voids the order (day 3) |
 | A reply and the deadline at once | Both lock the order's row; the second sees the first's outcome (day 3) |
 | A broker drop under a consumer | It closes its channel for good and subscribes again (day 3) |
+| Orders arrive faster than they can be charged | With `ORDERLY_MAX_AWAITING_PAYMENT`, an order past the cap is a 503 with Retry-After, nothing written; without it, the backlog grows and the deadline cancels and refunds what it couldn't charge (day 4, measured) |
 | The provider takes the money and its answer is lost | The handler times out, the command is retried, the provider's idempotent answer confirms it; if every answer is lost, the deadline's void refunds it (day 4) |
 
 ## Data
@@ -567,6 +568,14 @@ at start + i / rate, whatever happened to the others, so a slow target shows up 
 until the services are quiet (outboxes, every queue) and checks the books in the databases: every order settled once,
 the `CHARGED` cents equal to the `CONFIRMED` totals, the units taken equal to the confirmed units, one notification per
 order, no dead letters. The results are in README.md "Results (day 4)".
+
+**The awaiting cap (day 4)**, added because of the load test: with 64 clients the order service took 359 orders/s
+while the payment service charged about 171/s, and 2,769 of 10,000 orders waited out their deadline. With
+`ORDERLY_MAX_AWAITING_PAYMENT`, the order service's write (after the reservation, in the order's transaction) counts
+the orders awaiting payment and, at the cap, raises `Overloaded`: 503 `too_many_awaiting_payment` with `Retry-After:
+1`, everything rolled back. The count isn't locked (concurrent requests can overshoot by up to the pool's size), and a
+request refused by it re-checks its Idempotency-Key, as after an out-of-stock refusal. At 1,000 the same run had no
+timeouts: 6,010 taken and settled, 3,990 turned away.
 
 ## Days
 

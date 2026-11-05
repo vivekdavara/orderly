@@ -499,8 +499,8 @@ monolith's natural backpressure.
 Neither, as a headline. It answers the client 17 times faster (3.4 ms against 58 ms), is about as fast to the outcome,
 and its tail is better because the slow call no longer holds shared locks. Its throughput on this machine is the same
 kind of limit as the monolith's: connections held across a 50 ms provider call. The difference is what happens past the
-limit: the monolith slows everyone down; the services keep saying yes and let the saga's deadline clean up. The README's
-limitations say what would fix it (a cap on orders awaiting payment).
+limit: the monolith slows everyone down; the services keep saying yes and let the saga's deadline clean up. So the order
+service got a cap on orders awaiting payment (next question).
 
 **Why did 2.5 s of idleness after the broker came back cost 8 s?**
 Because of the headroom. While the broker is down, orders keep arriving at 100/s and pile up; once it's back the
@@ -516,6 +516,27 @@ monolith's row lock (day 2's two-orders-one-product test), the payment service's
 pool), the reconnect gap (the 30 s-backoff test). The tables are printed by a script from the runs' own JSON files, and
 the outage runs' samples are committed, so every number can be recomputed.
 
+**How does the cap on orders awaiting payment work, and why a 503?**
+`ORDERLY_MAX_AWAITING_PAYMENT` (off unless set). In the order's own transaction, after the stock is reserved, the
+order service counts the orders still `AWAITING_PAYMENT` (an index-only count on the sweeper's partial index); at the
+cap it raises `Overloaded`, the transaction rolls back (stock, order, command: nothing written) and the client gets
+`503 too_many_awaiting_payment` with `Retry-After: 1`. 503 rather than 429 because the service is out of capacity for
+everyone, not rate-limiting this client. The count isn't locked, so up to a pool's worth of concurrent requests can
+overshoot it: a brake, not an exact limit, and locking a counter row would serialize every order. One subtle case: two
+requests with one key, the first taking the last place; the second finds the cap reached by its own first attempt, so
+the key is re-checked after the refusal (as after an out-of-stock one) and it gets that order, not a 503. At 1,000 the
+day-4 overload run had no timeouts at all: 6,010 orders taken and settled (p99 8.3 s instead of 31.2 s), 3,990 turned
+away. Picking the number is the hard part: about the payment service's rate times the wait you'll accept, well under
+the deadline.
+
+**What did the review find on day 4?**
+Two defects, both in the day's test infrastructure, not in the services: the chaos proxy's `cut()` missed a connection
+whose upstream connect was still in flight (so a reconnect at the moment of a cut kept talking to the "unreachable"
+broker), and the contracts' "unlisted fields don't matter" check compared what a consumer wrote without its envelope
+(so a consumer copying the command's `occurred_at` into its reply would have passed). Both fixed, each with the
+reviewer's failing test. Its suspicion that a drain timing out still looked quiet was real, and my own first capped run
+tripped over the same code; its three surviving load-test mutants are now killed by its open-loop test.
+
 ## What went wrong on day 4
 
 - My first drain check in the load test read the books once both outboxes were empty and every order had its
@@ -525,6 +546,10 @@ the outage runs' samples are committed, so every number can be recomputed.
 - The broker-outage numbers first looked like a 20-fold win at the median (1.5 s to 64 ms). A per-10-seconds breakdown
   showed both runs slow until the backlog cleared and the median order sitting right at that edge, so the README
   reports the time until the services caught up (39 s to 31 s) instead.
+- My first run with the awaiting cap exited 1, "the books disagree": the books and the drain still expected every
+  order sent to exist, and refused orders never do, so the drain also waited out its 120 s. They count the orders
+  accepted now, and a drain that times out fails the books (the review had suspected the second half).
+
 ## What went wrong on day 3
 
 - The first end-to-end test of 60 orders used the fake provider's per-attempt error coin at 30%: about 1 order in 125
@@ -555,5 +580,6 @@ the outage runs' samples are committed, so every number can be recomputed.
 ## What's next
 
 Day 5: the release. README and WALKTHROUGH finished, the results gathered, `v1.0.0`. Carry-overs: no dead-letter
-replay tool (a dead-lettered refund leaves a customer charged until replayed), no backpressure on intake (an overload
-becomes timeouts and refunds), a stuck outbox row only reported, never parked.
+replay tool (a dead-lettered refund leaves a customer charged until replayed), backpressure only opt-in (an overload
+becomes timeouts and refunds unless the opt-in cap is set, and its number is picked by hand), a stuck outbox row only
+reported, never parked.
