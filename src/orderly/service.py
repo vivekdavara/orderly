@@ -20,6 +20,7 @@ import asyncio
 import importlib
 import logging
 import os
+import re
 from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -50,6 +51,8 @@ STOP_TIMEOUT = 30.0
 # shutdown keeps 5 s of margin on top: a longer pool timeout would let a stop cancel a batch between publish and
 # mark (day 2's carry-over, refused at startup since day 3). A test checks the sum.
 MAX_POOL_TIMEOUT = 5.0
+# What ORDERLY_TOPOLOGY_PREFIX may be: a prefix for exchange and queue names (at most 255 bytes each), nothing odd.
+TOPOLOGY_PREFIX = re.compile(r"[A-Za-z0-9._-]{0,64}")
 # The module whose create_app builds each service's app.
 BUILDERS = {
     "orders": "orderly.orders",
@@ -82,11 +85,16 @@ class Settings:
 
     @classmethod
     def from_environment(cls, service: str) -> Settings:
-        """ORDERLY_POOL_SIZE and ORDERLY_POOL_TIMEOUT_S override the pool's defaults."""
+        """ORDERLY_POOL_SIZE and ORDERLY_POOL_TIMEOUT_S override the pool's defaults. ORDERLY_TOPOLOGY_PREFIX puts every
+        exchange and queue under a prefix (the load test runs its services on a topology of its own; default none)."""
+        prefix = os.environ.get("ORDERLY_TOPOLOGY_PREFIX", "")
+        if not TOPOLOGY_PREFIX.fullmatch(prefix):
+            raise ValueError(f"ORDERLY_TOPOLOGY_PREFIX must be letters, digits, '.', '-' or '_', not {prefix!r}")
         return cls(
             service=service,
             database_url=database_url(service),
             amqp_url=amqp_url(),
+            topology=Topology(prefix=prefix),
             pool_size=int(os.environ.get("ORDERLY_POOL_SIZE", "10")),
             pool_timeout=float(os.environ.get("ORDERLY_POOL_TIMEOUT_S", "5")),
         )

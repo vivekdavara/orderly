@@ -289,3 +289,23 @@ def test_the_pool_settings_accept_their_limits(monkeypatch: pytest.MonkeyPatch) 
     assert (settings.pool_timeout, settings.pool_size) == (5.0, 1)
     with pytest.raises(ValueError, match="pool_size must be at least 1"):
         Settings("orders", "", "", pool_size=0)
+
+
+def test_the_topology_prefix_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ORDERLY_TOPOLOGY_PREFIX puts a service's exchanges and queues under a prefix (the load test's own topology);
+    unset, the names are the plain ones."""
+    monkeypatch.delenv("ORDERLY_TOPOLOGY_PREFIX", raising=False)
+    assert Settings.from_environment("orders").topology.commands == "orderly.commands"
+    monkeypatch.setenv("ORDERLY_TOPOLOGY_PREFIX", "load-1a2b.")
+    topology = Settings.from_environment("payments").topology
+    assert (topology.commands, topology.queue("payment.commands")) == (
+        "load-1a2b.orderly.commands",
+        "load-1a2b.payment.commands",
+    )
+
+
+@pytest.mark.parametrize("value", ["a b.", "load/1.", "x" * 65, "load\n"])
+def test_a_topology_prefix_with_odd_characters_is_refused(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("ORDERLY_TOPOLOGY_PREFIX", value)
+    with pytest.raises(ValueError, match="ORDERLY_TOPOLOGY_PREFIX must be"):
+        Settings.from_environment("orders")
