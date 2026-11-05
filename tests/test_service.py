@@ -318,3 +318,12 @@ def test_a_service_reconnects_every_second_unless_its_url_says_otherwise() -> No
     assert robust_url("amqp://h:5672/?heartbeat=30") == "amqp://h:5672/?heartbeat=30&reconnect_interval=1"
     assert robust_url("amqp://h:5672/?reconnect_interval=0.5") == "amqp://h:5672/?reconnect_interval=0.5"
     assert robust_url("amqp://h:5672/", 0.25) == "amqp://h:5672/?reconnect_interval=0.25"
+
+
+async def test_a_running_service_reconnects_every_second(fresh_database: str, topology: Topology) -> None:
+    """The interval is the services' own connection's, not only robust_url's answer (day-4 review: dropping
+    robust_url from the start-up left every test passing)."""
+    app = create_app(Settings("notifications", fresh_database, amqp_url(), topology))
+    async with running(app):
+        broker = app.state.resources.broker
+        assert broker is not None and broker.reconnect_interval == 1.0

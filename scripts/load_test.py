@@ -52,7 +52,7 @@ import psycopg
 from aio_pika.abc import AbstractIncomingMessage
 from psycopg import conninfo, sql
 
-from orderly.broker import amqp_url
+from orderly.broker import amqp_url, robust_url
 from orderly.messages import OrderCancelled, decode
 from orderly.migrate import migrate
 from orderly.seed import seed
@@ -130,6 +130,9 @@ class Run:
     started_at: str = ""
     # The services' cap on orders awaiting payment (ORDERLY_MAX_AWAITING_PAYMENT); None: none.
     max_awaiting: int | None = None
+    # Orders the target accepted, the untimed lead-in included: what the books must account for (refused ones are
+    # never written).
+    accepted_all: int = 0
     samples: list[Sample] = field(default_factory=list)
     send_seconds: float = 0.0
     settle_seconds: float = 0.0
@@ -205,7 +208,7 @@ class Outcomes:
 
     async def start(self) -> None:
         # Robust and durable: a broker outage (--broker-outage) mustn't lose the outcomes announced around it.
-        self.connection = await aio_pika.connect_robust(f"{amqp_url()}?reconnect_interval=0.5")
+        self.connection = await aio_pika.connect_robust(robust_url(amqp_url(), 0.5))
         channel = await self.connection.channel()
         await channel.set_qos(prefetch_count=1000)
         queue = await channel.declare_queue(self.queue_name, durable=True, arguments={"x-queue-type": "quorum"})
@@ -337,6 +340,7 @@ async def drive(
                     sample.outcome_at, sample.outcome = outcomes.seen[sample.order_id]
         last = max((s.outcome_at for s in run.samples if s.outcome_at), default=sent_done)
         run.settle_seconds = last - timed_t0
+        run.accepted_all = sum(1 for s in samples if s.order_id)
 
 
 async def queue_depths(topology: Topology) -> dict[str, int]:
@@ -353,13 +357,14 @@ async def queue_depths(topology: Topology) -> dict[str, int]:
         }
 
 
-async def wait_drained(run: Run, topology: Topology, timeout: float = 120.0) -> dict[str, int]:  # noqa: ASYNC109
-    """Until nothing is left to do (the services only): both outboxes empty, every queue empty, every order's
+async def wait_drained(run: Run, topology: Topology, timeout: float = 120.0) -> tuple[bool, dict[str, int]]:  # noqa: ASYNC109
+    """Until nothing is left to do (the services only): both outboxes empty, every queue empty, every accepted order's
     notification recorded, three times in a row half a second apart (a handler in flight holds its delivery unacked,
-    which no count shows, for about a provider call). Returns the dead-letter queues' counts."""
+    which no count shows, for about a provider call). Returns whether that happened before the timeout (a run that
+    never went quiet fails its books: day-4 review), and the dead-letter queues' counts."""
     if run.target != "services":
-        return {}
-    total = run.warmup + run.orders
+        return True, {}
+    total = run.accepted_all
     deadline = time.monotonic() + timeout
     quiet = 0
     depths: dict[str, int] = {}
@@ -376,10 +381,10 @@ async def wait_drained(run: Run, topology: Topology, timeout: float = 120.0) -> 
         busy = {name: n for name, n in depths.items() if n and not name.endswith(".dlq")}
         quiet = quiet + 1 if unpublished == 0 and not busy and told >= total else 0
         if quiet == 3:
-            return {name: n for name, n in depths.items() if name.endswith(".dlq")}
+            return True, {name: n for name, n in depths.items() if name.endswith(".dlq")}
         await asyncio.sleep(0.5)
     print("warning: the services never went quiet", file=sys.stderr)
-    return {name: n for name, n in depths.items() if name.endswith(".dlq")}
+    return False, {name: n for name, n in depths.items() if name.endswith(".dlq")}
 
 
 def books(run: Run) -> dict[str, Any]:
@@ -409,7 +414,7 @@ def books(run: Run) -> dict[str, Any]:
     with psycopg.connect(load_url(notifications_db)) as conn:
         notifications = conn.execute("SELECT count(*), count(DISTINCT order_id) FROM notifications").fetchone()
     assert confirmed_cents and confirmed_units and stock and charged and notifications
-    total = run.warmup + run.orders
+    total = run.accepted_all
     result = {
         "orders": statuses,
         "payments": payments,
@@ -530,11 +535,12 @@ async def main() -> int:
             outcomes = Outcomes(topology)
             await outcomes.start()
         await drive(run, bodies, outcomes, tuple(args.broker_outage) if args.broker_outage else None)
-        dead_lettered = await wait_drained(run, topology)
+        quiet, dead_lettered = await wait_drained(run, topology)
         run.books = books(run)
         if run.target == "services":
+            run.books["quiet"] = quiet
             run.books["dead_lettered"] = dead_lettered
-            run.books["ok"] = run.books["ok"] and not any(dead_lettered.values())
+            run.books["ok"] = run.books["ok"] and quiet and not any(dead_lettered.values())
     finally:
         stop_processes(processes)
         if outcomes is not None:
