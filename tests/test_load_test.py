@@ -112,3 +112,25 @@ def test_the_refusals_are_counted_and_timed_apart_from_the_accepted_orders() -> 
     }
     run.books = {"ok": True}
     assert load_test.failures(run, summary) == []
+
+
+def test_the_books_check_every_order_not_only_the_sums() -> None:
+    orders = {"a": ("CONFIRMED", 100, "USD"), "b": ("CANCELLED", 200, "USD"), "c": ("CANCELLED", 50, "USD")}
+    payments = {"a": ("CHARGED", 100, "USD"), "b": ("REFUNDED", 200, "USD")}  # c: no payment, nothing charged
+    told = {"a": ["order_confirmed"], "b": ["order_cancelled"], "c": ["order_cancelled"]}
+    assert load_test.order_mismatches(orders, payments, told) == []
+    # Two offsetting errors: the sums still agree (100 charged, 100 confirmed), the orders don't.
+    swapped = {"a": ("CHARGED", 50, "USD"), "b": ("REFUNDED", 200, "USD"), "c": ("CHARGED", 50, "USD")}
+    assert load_test.order_mismatches(orders, swapped, told) == [
+        "a: CONFIRMED for 100 USD, payment ('CHARGED', 50, 'USD')",
+        "c: CANCELLED, payment ('CHARGED', 50, 'USD')",
+    ]
+    assert load_test.order_mismatches(orders | {"d": ("AWAITING_PAYMENT", 10, "USD")}, payments, told) == [
+        "d: still AWAITING_PAYMENT"
+    ]
+    assert load_test.order_mismatches(orders, payments | {"z": ("CHARGED", 1, "USD")}, told) == [
+        "z: a payment for no order"
+    ]
+    assert load_test.order_mismatches(orders, payments, told | {"a": ["order_confirmed", "order_cancelled"]}) == [
+        "a: CONFIRMED, told ['order_cancelled', 'order_confirmed']"
+    ]

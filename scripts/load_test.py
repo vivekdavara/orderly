@@ -387,8 +387,36 @@ async def wait_drained(run: Run, topology: Topology, timeout: float = 120.0) -> 
     return False, {name: n for name, n in depths.items() if name.endswith(".dlq")}
 
 
+Row = tuple[str, int, str]  # (status, cents, currency)
+
+
+def order_mismatches(orders: dict[str, Row], payments: dict[str, Row], notified: dict[str, list[str]]) -> list[str]:
+    """Every order checked against its own payment and notifications (day-4 review: comparing sums alone would let two
+    offsetting errors pass). A confirmed order has a CHARGED payment for exactly its total and one confirmation; a
+    cancelled one has nothing charged (no payment, or DECLINED, REFUNDED, VOIDED) and one cancellation; nothing is
+    left awaiting payment, and no payment is for an order that doesn't exist."""
+    problems = []
+    for order_id, (status, total, currency) in orders.items():
+        payment = payments.get(order_id)
+        told = sorted(notified.get(order_id, []))
+        if status == "CONFIRMED":
+            if payment != ("CHARGED", total, currency):
+                problems.append(f"{order_id}: CONFIRMED for {total} {currency}, payment {payment}")
+            if told != ["order_confirmed"]:
+                problems.append(f"{order_id}: CONFIRMED, told {told}")
+        elif status == "CANCELLED":
+            if payment is not None and payment[0] not in ("DECLINED", "REFUNDED", "VOIDED"):
+                problems.append(f"{order_id}: CANCELLED, payment {payment}")
+            if told != ["order_cancelled"]:
+                problems.append(f"{order_id}: CANCELLED, told {told}")
+        else:
+            problems.append(f"{order_id}: still {status}")
+    problems += [f"{order_id}: a payment for no order" for order_id in payments.keys() - orders.keys()]
+    return problems
+
+
 def books(run: Run) -> dict[str, Any]:
-    """What the databases say after the run; `ok` is whether they agree with each other."""
+    """What the databases say after the run; `ok` is whether they agree with each other, order by order."""
     orders_db = "monolith" if run.target == "monolith" else "orders"
     payments_db = "monolith" if run.target == "monolith" else "payments"
     with psycopg.connect(load_url(orders_db)) as conn:
@@ -405,14 +433,29 @@ def books(run: Run) -> dict[str, Any]:
             " WHERE o.status = 'CONFIRMED'"
         ).fetchone()
         stock = conn.execute("SELECT sum(stock), count(*) FROM products").fetchone()
+        each_order = {
+            str(order_id): (status, cents, currency)
+            for order_id, status, cents, currency in conn.execute(
+                "SELECT id, status, total_cents, currency FROM orders"
+            ).fetchall()
+        }
     with psycopg.connect(load_url(payments_db)) as conn:
         payments: dict[str, int] = dict(conn.execute("SELECT status, count(*) FROM payments GROUP BY 1").fetchall())
         charged = conn.execute(
             "SELECT coalesce(sum(amount_cents), 0) FROM payments WHERE status = 'CHARGED'"
         ).fetchone()
+        each_payment = {
+            str(order_id): (status, cents, currency)
+            for order_id, status, cents, currency in conn.execute(
+                "SELECT order_id, status, amount_cents, currency FROM payments"
+            ).fetchall()
+        }
     notifications_db = "monolith" if run.target == "monolith" else "notifications"
     with psycopg.connect(load_url(notifications_db)) as conn:
         notifications = conn.execute("SELECT count(*), count(DISTINCT order_id) FROM notifications").fetchone()
+        notified: dict[str, list[str]] = {}
+        for order_id, kind in conn.execute("SELECT order_id, kind FROM notifications").fetchall():
+            notified.setdefault(str(order_id), []).append(kind)
     assert confirmed_cents and confirmed_units and stock and charged and notifications
     total = run.accepted_all
     result = {
@@ -425,8 +468,12 @@ def books(run: Run) -> dict[str, Any]:
         "notifications": int(notifications[0]),
         "notified_orders": int(notifications[1]),
     }
+    mismatches = order_mismatches(each_order, each_payment, notified)
+    result["order_mismatches"] = len(mismatches)
+    result["order_mismatch_examples"] = mismatches[:3]
     result["ok"] = (
-        sum(statuses.values()) == total
+        not mismatches
+        and sum(statuses.values()) == total
         and "AWAITING_PAYMENT" not in statuses
         and result["confirmed_cents"] == result["charged_cents"]
         and result["units_taken"] == result["confirmed_units"]
