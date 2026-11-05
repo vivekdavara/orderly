@@ -164,7 +164,9 @@ def create_app(
     provider: Provider | None = None,
     poll_interval: float = 1.0,
     prefetch: int = 8,
+    handler_timeout: float = 10.0,
 ) -> FastAPI:
+    """`handler_timeout` bounds each command's transaction, its provider call included (the consumer's default)."""
     the_provider: Provider = provider_from_environment() if provider is None else provider
     consumers: list[Consumer] = []
 
@@ -195,6 +197,7 @@ def create_app(
             handle=handle,
             accepts=frozenset({"payment.charge", "payment.refund"}),
             prefetch=prefetch,
+            handler_timeout=handler_timeout,
         )
         consumers.append(worker)
         await worker.run(stop)

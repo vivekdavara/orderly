@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 import psycopg
+from fastapi import FastAPI
 from helpers import running, stock
 
 from orderly import notifications, orders, payments
@@ -35,6 +36,8 @@ class Shop:
     databases: dict[str, str]
     provider: Provider
     mailer: FakeMailer
+    # The three apps (orders, payments, notifications): app.state.consumers has each one's consumer.
+    apps: tuple[FastAPI, ...] = ()
 
     async def order(self, sku: str = "WIDGET-1", quantity: int = 1, customer: str = "c-42") -> dict[str, Any]:
         body = {"customer_id": customer, "email": "ada@example.com", "lines": [{"sku": sku, "quantity": quantity}]}
@@ -62,23 +65,34 @@ class Shop:
 
 @asynccontextmanager
 async def open_shop(
-    databases: dict[str, str], topology: Topology, provider: Provider, payment_timeout: float = 30.0
+    databases: dict[str, str],
+    topology: Topology,
+    provider: Provider,
+    payment_timeout: float = 30.0,
+    *,
+    amqp: str | None = None,
+    payment_handler_timeout: float = 10.0,
 ) -> AsyncIterator[Shop]:
-    """The three services running, each on its own schema, sharing the broker's (prefixed) topology."""
+    """The three services running, each on its own schema, sharing the broker's (prefixed) topology. `amqp` is the
+    broker's URL for all three (a proxy's, to cut it); `payment_handler_timeout` bounds each payment command."""
     mailer = FakeMailer()
 
     def settings(service: str) -> Settings:
-        return Settings(service, databases[service], amqp_url(), topology)
+        return Settings(service, databases[service], amqp_url() if amqp is None else amqp, topology)
 
     apps = [
         orders.create_app(settings("orders"), payment_timeout=payment_timeout, poll_interval=0.2, sweep_interval=0.05),
-        payments.create_app(settings("payments"), provider=provider, poll_interval=0.2),
+        payments.create_app(
+            settings("payments"), provider=provider, poll_interval=0.2, handler_timeout=payment_handler_timeout
+        ),
         notifications.create_app(settings("notifications"), mailer=mailer),
     ]
     async with AsyncExitStack() as stack:
         clients = [await stack.enter_async_context(running(app)) for app in apps]
         stock(databases["orders"], [("WIDGET-1", 2599, 100)])
-        yield Shop(clients[0], clients[1], clients[2], databases=databases, provider=provider, mailer=mailer)
+        yield Shop(
+            clients[0], clients[1], clients[2], databases=databases, provider=provider, mailer=mailer, apps=tuple(apps)
+        )
 
 
 @dataclass
