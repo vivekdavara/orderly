@@ -1,0 +1,87 @@
+{
+  "consumer": "payments",
+  "description": "What the payment service reads in the order service's commands.",
+  "interactions": [
+    {
+      "name": "charge an order",
+      "producer": "orders",
+      "given": "an order of 2 x WIDGET-1 at 2599 USD by customer c-42 (ada@example.com)",
+      "message": {
+        "message_id": "8c1d6f0a-41b2-4b8e-9d3a-6a0f5c2e7b11",
+        "type": "payment.charge",
+        "version": 1,
+        "occurred_at": "2026-11-05T20:15:03.123456Z",
+        "correlation_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+        "causation_id": null,
+        "payload": {
+          "order_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+          "customer_id": "c-42",
+          "amount_cents": 5198,
+          "currency": "USD"
+        }
+      },
+      "match": {
+        "message_id": "uuid",
+        "payload.order_id": "order",
+        "payload.customer_id": "exact",
+        "payload.amount_cents": "exact",
+        "payload.currency": "exact"
+      },
+      "then": "the provider is asked to charge c-42 5198 USD; the payment is CHARGED; the reply is payment.succeeded"
+    },
+    {
+      "name": "refund an order that timed out",
+      "producer": "orders",
+      "given": "an order of 2 x WIDGET-1 at 2599 USD by customer c-42 (ada@example.com), whose payment deadline passed",
+      "message": {
+        "message_id": "c4b7e2d9-8f3a-4d61-a5e0-2b9c7d4f1a22",
+        "type": "payment.refund",
+        "version": 1,
+        "occurred_at": "2026-11-05T20:15:03.123456Z",
+        "correlation_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+        "causation_id": null,
+        "payload": {
+          "order_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+          "amount_cents": 5198,
+          "currency": "USD",
+          "reason": "payment_timeout"
+        }
+      },
+      "match": {
+        "message_id": "uuid",
+        "payload.order_id": "order",
+        "payload.amount_cents": "exact",
+        "payload.currency": "exact"
+      },
+      "consumer_state": "the order's charge of 5198 USD was taken",
+      "then": "the provider refunds the charge; the payment is REFUNDED; the reply is payment.refunded for 5198"
+    },
+    {
+      "name": "refund a success that came after a cancellation",
+      "producer": "orders",
+      "given": "an order of 2 x WIDGET-1 at 2599 USD by customer c-42 (ada@example.com), whose charge was declined, then a success arrived for it",
+      "message": {
+        "message_id": "e9a3c5b1-7d2f-4e8a-b6c4-3f1d9e7a5c33",
+        "type": "payment.refund",
+        "version": 1,
+        "occurred_at": "2026-11-05T20:15:03.123456Z",
+        "correlation_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+        "causation_id": "3e0f8b52-2d55-4c43-9a59-1f6b8f5a0c01",
+        "payload": {
+          "order_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+          "amount_cents": 5198,
+          "currency": "USD",
+          "reason": "order_cancelled"
+        }
+      },
+      "match": {
+        "message_id": "uuid",
+        "payload.order_id": "order",
+        "payload.amount_cents": "exact",
+        "payload.currency": "exact"
+      },
+      "consumer_state": "the order's charge of 5198 USD was taken",
+      "then": "the provider refunds the charge; the payment is REFUNDED; the reply is payment.refunded for 5198"
+    }
+  ]
+}

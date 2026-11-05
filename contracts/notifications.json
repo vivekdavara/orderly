@@ -1,0 +1,86 @@
+{
+  "consumer": "notifications",
+  "description": "What the notification service reads in the order service's announcements.",
+  "interactions": [
+    {
+      "name": "an order confirmed",
+      "producer": "orders",
+      "given": "an order of 2 x WIDGET-1 at 2599 USD by customer c-42 (ada@example.com), whose charge was approved",
+      "message": {
+        "message_id": "6f7a8b9c-0d1e-4f2a-9b4c-5d6e7f8a9bbb",
+        "type": "order.confirmed",
+        "version": 1,
+        "occurred_at": "2026-11-05T20:15:03.123456Z",
+        "correlation_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+        "causation_id": "3e0f8b52-2d55-4c43-9a59-1f6b8f5a0c01",
+        "payload": {
+          "order_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+          "customer_id": "c-42",
+          "email": "ada@example.com",
+          "total_cents": 5198,
+          "currency": "USD"
+        }
+      },
+      "match": {
+        "message_id": "uuid",
+        "payload.order_id": "order",
+        "payload.email": "exact",
+        "payload.total_cents": "exact",
+        "payload.currency": "exact"
+      },
+      "then": "one e-mail to ada@example.com: the order confirmed for 51.98 USD"
+    },
+    {
+      "name": "an order declined",
+      "producer": "orders",
+      "given": "an order of 2 x WIDGET-1 at 2599 USD by customer c-42 (ada@example.com), whose charge was declined",
+      "message": {
+        "message_id": "7a8b9c0d-1e2f-4a3b-8c5d-6e7f8a9b0ccc",
+        "type": "order.cancelled",
+        "version": 1,
+        "occurred_at": "2026-11-05T20:15:03.123456Z",
+        "correlation_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+        "causation_id": "3e0f8b52-2d55-4c43-9a59-1f6b8f5a0c01",
+        "payload": {
+          "order_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+          "customer_id": "c-42",
+          "email": "ada@example.com",
+          "reason": "payment_declined"
+        }
+      },
+      "match": {
+        "message_id": "uuid",
+        "payload.order_id": "order",
+        "payload.email": "exact",
+        "payload.reason": "exact"
+      },
+      "then": "one e-mail to ada@example.com: cancelled, the payment declined, nothing charged"
+    },
+    {
+      "name": "an order that timed out",
+      "producer": "orders",
+      "given": "an order of 2 x WIDGET-1 at 2599 USD by customer c-42 (ada@example.com), whose payment deadline passed",
+      "message": {
+        "message_id": "8b9c0d1e-2f3a-4b4c-9d6e-7f8a9b0c1ddd",
+        "type": "order.cancelled",
+        "version": 1,
+        "occurred_at": "2026-11-05T20:15:03.123456Z",
+        "correlation_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+        "causation_id": null,
+        "payload": {
+          "order_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+          "customer_id": "c-42",
+          "email": "ada@example.com",
+          "reason": "payment_timeout"
+        }
+      },
+      "match": {
+        "message_id": "uuid",
+        "payload.order_id": "order",
+        "payload.email": "exact",
+        "payload.reason": "exact"
+      },
+      "then": "one e-mail to ada@example.com: cancelled, the payment not confirmed in time, any charge refunded"
+    }
+  ]
+}

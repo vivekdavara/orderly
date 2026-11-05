@@ -34,6 +34,8 @@ from orderly.service import create_app as create_service_app
 
 QUEUE = "notification.order-events"
 CONSUMER = "notifications"
+# The messages its consumer takes (contracts/notifications.json says what it reads in each).
+ACCEPTS = frozenset({"order.confirmed", "order.cancelled"})
 
 
 class Mailer(Protocol):
@@ -109,7 +111,7 @@ def create_app(settings: Settings, *, mailer: Mailer | None = None, prefetch: in
             queue=QUEUE,
             name=CONSUMER,
             handle=handle,
-            accepts=frozenset({"order.confirmed", "order.cancelled"}),
+            accepts=ACCEPTS,
             prefetch=prefetch,
         )
         consumers.append(worker)

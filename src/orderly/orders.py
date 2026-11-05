@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import psycopg
@@ -53,6 +54,8 @@ SWEEP_INTERVAL = 1.0
 SWEEP_BATCH = 100
 QUEUE = "order.payment-events"
 CONSUMER = "orders"
+# The messages its consumer takes (contracts/orders.json says what it reads in each).
+ACCEPTS = frozenset({"payment.succeeded", "payment.failed", "payment.refunded"})
 
 log = logging.getLogger(__name__)
 
@@ -174,20 +177,10 @@ async def run_sweeper(pool: AsyncConnectionPool, stop: asyncio.Event, interval: 
         await wait_any(stop, timeout=interval)
 
 
-def payment_timeout_from_environment() -> float:
-    return float(os.environ.get("ORDERLY_PAYMENT_TIMEOUT_S", DEFAULT_PAYMENT_TIMEOUT))
-
-
-def create_app(
-    settings: Settings,
-    *,
-    payment_timeout: float | None = None,
-    poll_interval: float = 1.0,
-    sweep_interval: float = SWEEP_INTERVAL,
-    prefetch: int = 8,
-) -> FastAPI:
-    timeout = payment_timeout_from_environment() if payment_timeout is None else payment_timeout
-    consumers: list[Consumer] = []
+def order_writer(payment_timeout: float) -> Callable[[OrderRequest, str | None], ordering.Write]:
+    """The order service's write after the reservation, for `ordering.take_order`: the order as AWAITING_PAYMENT with
+    its deadline `payment_timeout` seconds away, its lines, and `payment.charge` to the outbox, in the request's
+    transaction. (The contract tests run it without the app.)"""
 
     def write_for(body: OrderRequest, key: str | None) -> ordering.Write:
         async def write(conn: Connection, order_id: uuid.UUID, reserved: Reserved) -> None:
@@ -203,7 +196,7 @@ def create_app(
                     reserved.currency,
                     key,
                     None if key is None else body.fingerprint(),
-                    timeout,
+                    payment_timeout,
                 ),
             )
             await ordering.insert_lines(conn, order_id, reserved)
@@ -217,6 +210,24 @@ def create_app(
             await outbox.write(conn, new_message(charge))
 
         return write
+
+    return write_for
+
+
+def payment_timeout_from_environment() -> float:
+    return float(os.environ.get("ORDERLY_PAYMENT_TIMEOUT_S", DEFAULT_PAYMENT_TIMEOUT))
+
+
+def create_app(
+    settings: Settings,
+    *,
+    payment_timeout: float | None = None,
+    poll_interval: float = 1.0,
+    sweep_interval: float = SWEEP_INTERVAL,
+    prefetch: int = 8,
+) -> FastAPI:
+    timeout = payment_timeout_from_environment() if payment_timeout is None else payment_timeout
+    consumers: list[Consumer] = []
 
     async def relay(resources: Resources, stop: asyncio.Event) -> None:
         if resources.broker is None:
@@ -239,7 +250,7 @@ def create_app(
             queue=QUEUE,
             name=CONSUMER,
             handle=handle_reply,
-            accepts=frozenset({"payment.succeeded", "payment.failed", "payment.refunded"}),
+            accepts=ACCEPTS,
             prefetch=prefetch,
         )
         consumers.append(worker)
@@ -249,7 +260,7 @@ def create_app(
         await run_sweeper(resources.pool, stop, sweep_interval)
 
     # Every order taken is 201: where its saga stands is in the body's status.
-    router = order_api.router(write_for, status_code=lambda order: 201)
+    router = order_api.router(order_writer(timeout), status_code=lambda order: 201)
     app = create_service_app(settings, router=router, workers=[relay, consumer, sweeper])
     app.state.consumers = consumers
     return app

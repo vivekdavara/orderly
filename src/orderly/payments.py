@@ -38,6 +38,8 @@ from orderly.service import create_app as create_service_app
 
 QUEUE = "payment.commands"
 CONSUMER = "payments"
+# The messages its consumer takes (contracts/payments.json says what it reads in each).
+ACCEPTS = frozenset({"payment.charge", "payment.refund"})
 # The class of the advisory locks this service takes on orders (the key is the order id's hash): its own number, so
 # they can't meet the migrations' lock or another service's.
 LOCK_CLASS = 4113
@@ -195,7 +197,7 @@ def create_app(
             queue=QUEUE,
             name=CONSUMER,
             handle=handle,
-            accepts=frozenset({"payment.charge", "payment.refund"}),
+            accepts=ACCEPTS,
             prefetch=prefetch,
             handler_timeout=handler_timeout,
         )

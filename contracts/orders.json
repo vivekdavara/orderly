@@ -1,0 +1,129 @@
+{
+  "consumer": "orders",
+  "description": "What the order service (the saga's orchestrator) reads in the payment service's replies.",
+  "interactions": [
+    {
+      "name": "a charge approved",
+      "producer": "payments",
+      "given": "a charge of 5198 USD for customer c-42, approved",
+      "message": {
+        "message_id": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c44",
+        "type": "payment.succeeded",
+        "version": 1,
+        "occurred_at": "2026-11-05T20:15:03.123456Z",
+        "correlation_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+        "causation_id": "3e0f8b52-2d55-4c43-9a59-1f6b8f5a0c01",
+        "payload": {
+          "order_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+          "payment_id": "5d4c3b2a-1f0e-4d9c-8b7a-6f5e4d3c2b55",
+          "amount_cents": 5198,
+          "currency": "USD"
+        }
+      },
+      "match": {
+        "message_id": "uuid",
+        "payload.order_id": "order"
+      },
+      "consumer_state": "the order awaits its payment",
+      "then": "the order is CONFIRMED and order.confirmed is written"
+    },
+    {
+      "name": "a charge declined",
+      "producer": "payments",
+      "given": "a charge of 5198 USD for customer c-42, declined by the provider",
+      "message": {
+        "message_id": "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d66",
+        "type": "payment.failed",
+        "version": 1,
+        "occurred_at": "2026-11-05T20:15:03.123456Z",
+        "correlation_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+        "causation_id": "3e0f8b52-2d55-4c43-9a59-1f6b8f5a0c01",
+        "payload": {
+          "order_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+          "reason": "declined"
+        }
+      },
+      "match": {
+        "message_id": "uuid",
+        "payload.order_id": "order",
+        "payload.reason": "exact"
+      },
+      "consumer_state": "the order awaits its payment",
+      "then": "the order is CANCELLED (payment_declined), its stock released, and order.cancelled written"
+    },
+    {
+      "name": "a charge refused after a void",
+      "producer": "payments",
+      "given": "a charge of 5198 USD arriving after the order's refund voided it",
+      "message": {
+        "message_id": "3c4d5e6f-7a8b-4c9d-8e1f-2a3b4c5d6e77",
+        "type": "payment.failed",
+        "version": 1,
+        "occurred_at": "2026-11-05T20:15:03.123456Z",
+        "correlation_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+        "causation_id": "3e0f8b52-2d55-4c43-9a59-1f6b8f5a0c01",
+        "payload": {
+          "order_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+          "reason": "voided"
+        }
+      },
+      "match": {
+        "message_id": "uuid",
+        "payload.order_id": "order",
+        "payload.reason": "exact"
+      },
+      "consumer_state": "the order was cancelled at its deadline and asked for a refund",
+      "then": "nothing changes: the order stays CANCELLED (payment_timeout)"
+    },
+    {
+      "name": "a charge refunded",
+      "producer": "payments",
+      "given": "a refund of an approved charge of 5198 USD",
+      "message": {
+        "message_id": "4d5e6f7a-8b9c-4d0e-9f2a-3b4c5d6e7f88",
+        "type": "payment.refunded",
+        "version": 1,
+        "occurred_at": "2026-11-05T20:15:03.123456Z",
+        "correlation_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+        "causation_id": "3e0f8b52-2d55-4c43-9a59-1f6b8f5a0c01",
+        "payload": {
+          "order_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+          "payment_id": "5d4c3b2a-1f0e-4d9c-8b7a-6f5e4d3c2b55",
+          "amount_cents": 5198,
+          "currency": "USD"
+        }
+      },
+      "match": {
+        "message_id": "uuid",
+        "payload.order_id": "order"
+      },
+      "consumer_state": "the order was cancelled at its deadline and asked for a refund",
+      "then": "nothing changes: the refund it asked for is confirmed"
+    },
+    {
+      "name": "a refund with nothing charged",
+      "producer": "payments",
+      "given": "a refund of 5198 USD arriving before any charge",
+      "message": {
+        "message_id": "5e6f7a8b-9c0d-4e1f-8a3b-4c5d6e7f8a99",
+        "type": "payment.refunded",
+        "version": 1,
+        "occurred_at": "2026-11-05T20:15:03.123456Z",
+        "correlation_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+        "causation_id": "3e0f8b52-2d55-4c43-9a59-1f6b8f5a0c01",
+        "payload": {
+          "order_id": "0b8f6f8e-1d1f-4f4e-8a3c-7f0f2b9d5e11",
+          "payment_id": "6e5d4c3b-2a1f-4e0d-9c8b-7a6f5e4d3caa",
+          "amount_cents": 0,
+          "currency": "USD"
+        }
+      },
+      "match": {
+        "message_id": "uuid",
+        "payload.order_id": "order"
+      },
+      "consumer_state": "the order was cancelled at its deadline and asked for a refund",
+      "then": "nothing changes: the refund it asked for is confirmed"
+    }
+  ]
+}
