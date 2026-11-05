@@ -97,3 +97,29 @@ def fresh_database(test_database: str) -> Iterator[str]:
     finally:
         with psycopg.connect(test_database, autocommit=True) as conn:
             conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pytest.fixture
+def databases(test_database: str) -> Iterator[dict[str, str]]:
+    """One empty schema per service, as if each had its own database (the whole-saga tests, tests/shop.py)."""
+    schemas = {service: f"t_{uuid.uuid4().hex[:12]}" for service in ("orders", "payments", "notifications")}
+    with psycopg.connect(test_database, autocommit=True) as conn:
+        for schema in schemas.values():
+            conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    try:
+        yield {s: conninfo.make_conninfo(test_database, options=f"-c search_path={n}") for s, n in schemas.items()}
+    finally:
+        with psycopg.connect(test_database, autocommit=True) as conn:
+            for schema in schemas.values():
+                conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pytest.fixture
+async def short_topology(connection: AbstractConnection) -> AsyncIterator[Topology]:
+    """A private topology whose retry delays are 0.1, 0.2 and 0.4 s, so four attempts take under a second."""
+    topology = Topology(prefix=f"test-{uuid.uuid4().hex[:12]}.", retry_delays=(0.1, 0.2, 0.4))
+    async with connection.channel() as setup:
+        await topology.declare(setup)
+    yield topology
+    async with connection.channel() as cleanup:
+        await topology.delete(cleanup)
