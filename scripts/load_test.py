@@ -128,6 +128,8 @@ class Run:
     payment_timeout_s: float
     seed: int
     started_at: str = ""
+    # The services' cap on orders awaiting payment (ORDERLY_MAX_AWAITING_PAYMENT); None: none.
+    max_awaiting: int | None = None
     samples: list[Sample] = field(default_factory=list)
     send_seconds: float = 0.0
     settle_seconds: float = 0.0
@@ -143,6 +145,7 @@ def start_processes(run: Run, prefix: str, log_dir: Path) -> list[subprocess.Pop
             "ORDERLY_PROVIDER_LATENCY_MS": f"{run.provider_ms:g}",
             "ORDERLY_PROVIDER_DECLINE_RATIO": f"{run.decline_ratio:g}",
             "ORDERLY_PAYMENT_TIMEOUT_S": f"{run.payment_timeout_s:g}",
+            "ORDERLY_MAX_AWAITING_PAYMENT": "" if run.max_awaiting is None else str(run.max_awaiting),
         }
     )
     for service in TARGETS[run.target]:
@@ -247,6 +250,9 @@ async def send(client: httpx.AsyncClient, base: str, sample: Sample, body: dict[
             sample.outcome = (
                 "CONFIRMED" if placed["status"] == "CONFIRMED" else f"CANCELLED:{placed.get('cancel_reason')}"
             )
+    elif response.status_code == 503 and "too_many_awaiting_payment" in response.text:
+        sample.outcome = "REFUSED"  # turned away by the cap: no order, by design (not an error)
+        sample.outcome_at = sample.answered
     else:
         sample.error = f"HTTP {response.status_code}: {response.text[:200]}"
 
@@ -455,6 +461,7 @@ def summarize(run: Run) -> dict[str, Any]:
     e2e = sorted(s.outcome_at - s.due for s in ok if s.outcome_at)
     summary: dict[str, Any] = {
         "accepted": len(ok),
+        "refused": sum(1 for s in timed if s.outcome == "REFUSED"),
         "errors": Counter(s.error.split(":")[0] for s in timed if s.error),
         "settled": len(e2e),
         "outcomes": Counter(s.outcome for s in ok if s.outcome),
@@ -485,6 +492,7 @@ async def main() -> int:
     parser.add_argument("--decline-ratio", type=float, default=0.1)
     parser.add_argument("--payment-timeout", type=float, default=30.0, help="the services' payment deadline, seconds")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--max-awaiting", type=int, help="the services' cap on orders awaiting payment (default none)")
     parser.add_argument("--broker-outage", type=float, nargs=2, metavar=("START", "SECONDS"))
     parser.add_argument("--json", type=Path, help="write the run's settings, summary and books here")
     parser.add_argument("--samples", type=Path, help="write every timed order here, as CSV (times in seconds)")
@@ -504,6 +512,7 @@ async def main() -> int:
         payment_timeout_s=args.payment_timeout,
         seed=args.seed,
         started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        max_awaiting=args.max_awaiting,
     )
     bodies = order_bodies(run.warmup + run.orders, random.Random(args.seed))
     for service in TARGETS[run.target]:
@@ -538,7 +547,8 @@ async def main() -> int:
     loop = f"open loop at {run.rate:g}/s" if run.rate is not None else f"closed loop, {run.concurrency} clients"
     print(
         f"{run.target}: {run.orders} orders (+{run.warmup} untimed), {loop}, provider {run.provider_ms:g} ms,"
-        f" decline {run.decline_ratio:g}, payment timeout {run.payment_timeout_s:g} s, seed {run.seed}"
+        f" decline {run.decline_ratio:g}, payment timeout {run.payment_timeout_s:g} s, seed {run.seed},"
+        f" awaiting cap {run.max_awaiting or 'none'}"
     )
     print(json.dumps(summary | {"books": run.books, "outage": run.outage}, indent=2, default=dict))
     if args.json is not None:
@@ -572,8 +582,9 @@ def failures(run: Run, summary: dict[str, Any]) -> list[str]:
     """Why the run doesn't count (an exit status of 1): an order refused or lost, an outcome missing, the books
     disagreeing. Slow is not a failure; wrong is."""
     problems = []
-    if summary["accepted"] != run.orders:
-        problems.append(f"{run.orders - summary['accepted']} of {run.orders} orders not accepted: {summary['errors']}")
+    if summary["accepted"] + summary.get("refused", 0) != run.orders:
+        missing = run.orders - summary["accepted"] - summary.get("refused", 0)
+        problems.append(f"{missing} of {run.orders} orders neither accepted nor refused: {summary['errors']}")
     if summary["settled"] != summary["accepted"]:
         problems.append(f"{summary['accepted'] - summary['settled']} accepted orders never settled")
     if not run.books.get("ok"):

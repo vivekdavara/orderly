@@ -105,6 +105,11 @@ class KeyReused(OrderRefused):
     status = 422
 
 
+class Overloaded(Exception):
+    """Too many orders are awaiting payment to take another (the order service's cap, day 4): nothing was written, and
+    the client should try again later (503 with Retry-After, not a refusal of the order itself)."""
+
+
 @dataclass(frozen=True)
 class ReservedLine:
     line_no: int
@@ -245,9 +250,10 @@ async def take_order(pool: AsyncConnectionPool, request: OrderRequest, key: str 
         except psycopg.errors.UniqueViolation as error:
             if key is None or error.diag.constraint_name != _KEY_CONSTRAINT:
                 raise
-        except OutOfStock:
-            # A request with the same key may have taken the stock this one was waiting for: it was this request's
-            # first attempt, and the client should get its order, not a 409 (re-check the key after a refusal).
+        except (OutOfStock, Overloaded):
+            # A request with the same key may have taken the stock this one was waiting for (or the last place under
+            # the cap): it was this request's first attempt, and the client should get its order, not a 409 or a 503
+            # (re-check the key after a refusal).
             if key is not None:
                 async with pool.connection() as conn, conn.transaction():
                     earlier = await replay(conn, key, fingerprint)

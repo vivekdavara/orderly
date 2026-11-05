@@ -41,7 +41,7 @@ from orderly.messages import (
     RefundPayment,
     new_message,
 )
-from orderly.ordering import Connection, OrderRequest, Reserved
+from orderly.ordering import Connection, OrderRequest, Overloaded, Reserved
 from orderly.outbox import Relay, wait_any
 from orderly.saga import DeadlinePassed, OrderState, SagaInput, Step, transition
 from orderly.service import Resources, Settings
@@ -177,13 +177,27 @@ async def run_sweeper(pool: AsyncConnectionPool, stop: asyncio.Event, interval: 
         await wait_any(stop, timeout=interval)
 
 
-def order_writer(payment_timeout: float) -> Callable[[OrderRequest, str | None], ordering.Write]:
+def order_writer(
+    payment_timeout: float, max_awaiting: int | None = None
+) -> Callable[[OrderRequest, str | None], ordering.Write]:
     """The order service's write after the reservation, for `ordering.take_order`: the order as AWAITING_PAYMENT with
     its deadline `payment_timeout` seconds away, its lines, and `payment.charge` to the outbox, in the request's
-    transaction. (The contract tests run it without the app.)"""
+    transaction. (The contract tests run it without the app.)
+
+    With `max_awaiting`, an order finding that many orders already awaiting payment raises `Overloaded` instead (503,
+    everything rolled back): the day-4 load test showed the service taking orders faster than the payment service could
+    charge them, until they timed out. The count isn't locked, so concurrent requests can overshoot it by up to the
+    pool's size; it is a brake, not an exact limit."""
 
     def write_for(body: OrderRequest, key: str | None) -> ordering.Write:
         async def write(conn: Connection, order_id: uuid.UUID, reserved: Reserved) -> None:
+            if max_awaiting is not None:
+                row = await (
+                    await conn.execute("SELECT count(*) FROM orders WHERE status = 'AWAITING_PAYMENT'")
+                ).fetchone()
+                awaiting = 0 if row is None else int(row[0])
+                if awaiting >= max_awaiting:
+                    raise Overloaded(f"{awaiting} orders are awaiting payment (at most {max_awaiting}); try again")
             await conn.execute(
                 "INSERT INTO orders (id, customer_id, email, status, total_cents, currency, idempotency_key,"
                 " request_hash, payment_deadline)"
@@ -218,6 +232,17 @@ def payment_timeout_from_environment() -> float:
     return float(os.environ.get("ORDERLY_PAYMENT_TIMEOUT_S", DEFAULT_PAYMENT_TIMEOUT))
 
 
+def max_awaiting_from_environment() -> int | None:
+    """ORDERLY_MAX_AWAITING_PAYMENT: the cap on orders awaiting payment (unset or empty: none)."""
+    value = os.environ.get("ORDERLY_MAX_AWAITING_PAYMENT", "")
+    if not value:
+        return None
+    cap = int(value)
+    if cap < 1:
+        raise ValueError(f"ORDERLY_MAX_AWAITING_PAYMENT must be at least 1, not {cap}")
+    return cap
+
+
 def create_app(
     settings: Settings,
     *,
@@ -225,8 +250,11 @@ def create_app(
     poll_interval: float = 1.0,
     sweep_interval: float = SWEEP_INTERVAL,
     prefetch: int = 8,
+    max_awaiting: int | None = None,
 ) -> FastAPI:
+    """`max_awaiting` caps the orders awaiting payment (default: ORDERLY_MAX_AWAITING_PAYMENT, else none)."""
     timeout = payment_timeout_from_environment() if payment_timeout is None else payment_timeout
+    cap = max_awaiting_from_environment() if max_awaiting is None else max_awaiting
     consumers: list[Consumer] = []
 
     async def relay(resources: Resources, stop: asyncio.Event) -> None:
@@ -260,7 +288,11 @@ def create_app(
         await run_sweeper(resources.pool, stop, sweep_interval)
 
     # Every order taken is 201: where its saga stands is in the body's status.
-    router = order_api.router(order_writer(timeout), status_code=lambda order: 201)
+    router = order_api.router(
+        order_writer(timeout, cap),
+        status_code=lambda order: 201,
+        unavailable={Overloaded: "too_many_awaiting_payment"},
+    )
     app = create_service_app(settings, router=router, workers=[relay, consumer, sweeper])
     app.state.consumers = consumers
     return app

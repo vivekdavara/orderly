@@ -29,6 +29,8 @@ def row(path: Path) -> str:
         f"{n:,} {kind.split(':')[1].replace('payment_', '')}" for kind, n in sorted(outcomes.items()) if ":" in kind
     )
     settled = f"{outcomes.get('CONFIRMED', 0):,} confirmed, {cancelled} cancelled"
+    if summary.get("refused"):
+        settled += f"; {summary['refused']:,} refused (503, the cap)"
     books = "agree" if run["books"].get("ok") else "**disagree**"
     return (
         f"| {run['target']} | {loop} | {summary['sent_per_s']:,.1f} | {summary['settled_per_s']:,.1f} |"

@@ -229,3 +229,61 @@ async def test_health_counts_rows_that_fail_on_their_own(service: OrderService) 
     assert body["status"] == "ok" and body["outbox"]["unpublished"] == 1 and body["outbox"]["failing"] == 1
     await queue.bind(service.topology.commands, "payment.charge")
     await service.commands(1, timeout=10.0)  # published at its next attempt
+
+
+@pytest.fixture
+async def capped(fresh_database: str, topology: Topology, channel: AbstractChannel) -> AsyncIterator[OrderService]:
+    """The order service with at most 3 orders awaiting payment (and no payment service, so they stay awaiting)."""
+    settings = Settings("orders", fresh_database, amqp_url(), topology)
+    app = orders.create_app(settings, payment_timeout=30.0, max_awaiting=3)
+    async with running(app) as client:
+        stock(fresh_database, [("WIDGET-1", 2599, 10)])
+        yield OrderService(client, app, fresh_database, topology, channel)
+
+
+async def test_over_the_awaiting_cap_an_order_is_a_503_that_writes_nothing(capped: OrderService) -> None:
+    """Day 4's load test: with 64 clients the service took orders faster than they could be charged, until 2,769 of
+    10,000 timed out. With a cap, the order past it is turned away (503, Retry-After) with nothing reserved or sent,
+    and one is taken again once an order leaves AWAITING_PAYMENT."""
+    taken = [await capped.order([("WIDGET-1", 1)]) for _ in range(3)]
+    assert [r.status_code for r in taken] == [201, 201, 201]
+    refused = await capped.order([("WIDGET-1", 2)], key="past-the-cap")
+    assert refused.status_code == 503 and refused.headers["Retry-After"] == "1"
+    assert refused.json()["detail"]["error"] == "too_many_awaiting_payment"
+    assert stock_of(capped.url, "WIDGET-1") == 7 and count(capped.url, "orders") == 3
+    assert [kind for kind, _ in outbox_rows(capped.url)] == ["payment.charge"] * 3
+    await capped.commands(3)
+
+    with psycopg.connect(capped.url) as conn:
+        conn.execute("UPDATE orders SET status = 'CONFIRMED' WHERE id = %s", (taken[0].json()["id"],))
+    again = await capped.order([("WIDGET-1", 2)], key="past-the-cap")
+    assert again.status_code == 201 and again.headers.get("Idempotent-Replayed") is None
+    assert stock_of(capped.url, "WIDGET-1") == 5
+
+
+async def test_a_retry_refused_by_the_cap_gets_the_order_its_first_attempt_made(
+    fresh_database: str, topology: Topology, channel: AbstractChannel
+) -> None:
+    """Two requests with one key at once, the first taking the last place under the cap: the second, finding the cap
+    reached (by its own first attempt), gets that order back rather than a 503 (the key is re-checked after the
+    refusal, as after an out-of-stock one)."""
+    settings = Settings("orders", fresh_database, amqp_url(), topology)
+    app = orders.create_app(settings, payment_timeout=30.0, max_awaiting=1)
+    async with running(app) as client:
+        stock(fresh_database, [("WIDGET-1", 2599, 10)])
+        service = OrderService(client, app, fresh_database, topology, channel)
+        first, second = await asyncio.gather(
+            service.order([("WIDGET-1", 1)], key="twice"), service.order([("WIDGET-1", 1)], key="twice")
+        )
+        assert sorted([first.status_code, second.status_code]) == [201, 201]
+        assert first.json()["id"] == second.json()["id"] and count(fresh_database, "orders") == 1
+
+
+def test_the_awaiting_cap_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ORDERLY_MAX_AWAITING_PAYMENT", raising=False)
+    assert orders.max_awaiting_from_environment() is None
+    monkeypatch.setenv("ORDERLY_MAX_AWAITING_PAYMENT", "2000")
+    assert orders.max_awaiting_from_environment() == 2000
+    monkeypatch.setenv("ORDERLY_MAX_AWAITING_PAYMENT", "0")
+    with pytest.raises(ValueError, match="at least 1"):
+        orders.max_awaiting_from_environment()
