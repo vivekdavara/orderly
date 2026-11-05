@@ -1,0 +1,63 @@
+{
+  "target": "services",
+  "orders": 10000,
+  "warmup": 200,
+  "rate": null,
+  "concurrency": 64,
+  "provider_ms": 50.0,
+  "decline_ratio": 0.1,
+  "payment_timeout_s": 30.0,
+  "seed": 1,
+  "started_at": "2026-11-05T15:29:05-0500",
+  "send_seconds": 27.82520462491084,
+  "settle_seconds": 58.48048733291216,
+  "books": {
+    "orders": {
+      "CANCELLED:payment_timeout": 2769,
+      "CONFIRMED": 6691,
+      "CANCELLED:payment_declined": 740
+    },
+    "payments": {
+      "CHARGED": 6691,
+      "DECLINED": 1034,
+      "REFUNDED": 2475
+    },
+    "confirmed_cents": 158570199,
+    "charged_cents": 158570199,
+    "units_taken": 26783,
+    "confirmed_units": 26783,
+    "notifications": 10200,
+    "notified_orders": 10200,
+    "ok": true,
+    "dead_lettered": {
+      "load-0c256adb.payment.commands.dlq": 0,
+      "load-0c256adb.order.payment-events.dlq": 0,
+      "load-0c256adb.notification.order-events.dlq": 0
+    }
+  },
+  "outage": {},
+  "summary": {
+    "accepted": 10000,
+    "errors": {},
+    "settled": 10000,
+    "outcomes": {
+      "CONFIRMED": 6512,
+      "CANCELLED:payment_declined": 719,
+      "CANCELLED:payment_timeout": 2769
+    },
+    "sent_per_s": 359.4,
+    "settled_per_s": 171.0,
+    "accept_ms": {
+      "p50": 106.9,
+      "p95": 566.3,
+      "p99": 1054.0,
+      "max": 4885.9
+    },
+    "end_to_end_ms": {
+      "p50": 20444.8,
+      "p95": 31003.8,
+      "p99": 31238.3,
+      "max": 31851.4
+    }
+  }
+}

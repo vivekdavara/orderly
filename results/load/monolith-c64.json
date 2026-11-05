@@ -1,0 +1,55 @@
+{
+  "target": "monolith",
+  "orders": 10000,
+  "warmup": 200,
+  "rate": null,
+  "concurrency": 64,
+  "provider_ms": 50.0,
+  "decline_ratio": 0.1,
+  "payment_timeout_s": 30.0,
+  "seed": 1,
+  "started_at": "2026-11-05T15:27:45-0500",
+  "send_seconds": 76.57076962501742,
+  "settle_seconds": 76.5707042090362,
+  "books": {
+    "orders": {
+      "CANCELLED:payment_declined": 1048,
+      "CONFIRMED": 9152
+    },
+    "payments": {
+      "CHARGED": 9152,
+      "DECLINED": 1048
+    },
+    "confirmed_cents": 216895442,
+    "charged_cents": 216895442,
+    "units_taken": 36644,
+    "confirmed_units": 36644,
+    "notifications": 10200,
+    "notified_orders": 10200,
+    "ok": true
+  },
+  "outage": {},
+  "summary": {
+    "accepted": 10000,
+    "errors": {},
+    "settled": 10000,
+    "outcomes": {
+      "CONFIRMED": 8973,
+      "CANCELLED:payment_declined": 1027
+    },
+    "sent_per_s": 130.6,
+    "settled_per_s": 130.6,
+    "accept_ms": {
+      "p50": 479.4,
+      "p95": 582.4,
+      "p99": 704.2,
+      "max": 1055.1
+    },
+    "end_to_end_ms": {
+      "p50": 479.4,
+      "p95": 582.4,
+      "p99": 704.2,
+      "max": 1055.1
+    }
+  }
+}

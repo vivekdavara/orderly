@@ -2,7 +2,8 @@
 
 The questions an interviewer is likely to ask about this project, with short answers grounded in the code. Day 1
 covers the design, the message contracts, the RabbitMQ topology, the migrations and the scripts; day 2 the monolith,
-taking an order, the order service and the outbox; later days add the other services.
+taking an order, the order service and the outbox; day 3 the payment and notification services and the saga; day 4
+the contract tests, failure injection and the load test.
 
 ## The project
 
@@ -422,6 +423,108 @@ subscription live, so deliveries kept starting handlers that the drain (waiting 
 has begun, every channel call has a 2 s `control_timeout`, and the bound is 24 s against shutdown's 30. The lesson,
 again: a fix for a timeout needs its own review, because bounding one wait changes what happens after it.
 
+## Contracts, failure injection and the load test (day 4)
+
+**What is a consumer-driven contract here, and what does it catch that the shared message code doesn't?**
+Each consumer owns a file, `contracts/<consumer>.json`: for each message it takes, an example, the state its producer
+must be in to send it (`given`), and `match`, the fields it actually reads and what it needs of each (the exact value,
+any id, or the order's id). `tests/test_contracts.py` runs the consumer's real handler on the example and checks it
+does what the contract says, runs the producer's real code into `given` and checks the message it writes matches, and
+checks the examples against the decoder, the published JSON Schema and the topology. With one codebase, the shapes
+can't drift: every service decodes with `messages.py`. What the contracts pin is semantics: that a declined charge is
+`payment.failed` with reason `declined` (not `voided`, which the order service ignores while it awaits payment), that a
+refund after a cancellation is for the order's whole amount, that the cancellation e-mail's reason is the one the order
+service decided. A mutant announcing a declined order as timed out fails both the producer's and the consumer's test.
+
+**How do you know a consumer doesn't read a field its contract leaves out?**
+The test changes every unlisted field to another valid value (a different customer id, amount, currency, reason, time,
+cause) and checks the consumer does exactly the same: same rows, same provider calls, same messages written, same
+e-mail. So `match` can't claim less than the consumer uses; a mutant that put the customer id into the e-mail failed all
+three notification contracts. The useful by-product is the list of what nobody reads: the order service doesn't read a
+success's amount (it trusts the payment service, which charges the amount the order asked for and refuses a command
+that contradicts its row), the payment service ignores a refund's reason, and no consumer reads `order.confirmed`'s
+`customer_id`. A producer may change those freely; it may not change the others without the consumer's file changing
+first.
+
+**How do you take the broker down in a test that also runs in CI?**
+`tests/chaos.py` is a TCP proxy: the services connect to RabbitMQ through it, and the test cuts it (every connection
+aborted, the listener closed so reconnects are refused) and restores it. The shared broker never stops, so tests stay
+isolated from each other and it works against a CI service container. The load test stops the real node instead
+(`--broker-outage`), which is the harsher case: the broker forces every connection closed and comes back from disk.
+
+**What did failure injection show?**
+That the design holds: orders are taken while the broker is down (the request never touches it), their commands wait in
+the outbox, and when it's back everything settles once; every message delivered twice changes nothing (the consumers
+skip every copy and the provider is asked once per order); the provider taking the money and losing its answer ends in
+one charge, or, if every answer is lost, a refund through the deadline's void. And one thing that wasn't fine, from the
+load test rather than the tests: recovery after the broker came back was slow (next question).
+
+**Why did the services take seconds to notice the broker was back, and what changed?**
+Two waits stacked up. aio-pika's robust connection retries every 5 s by default, so the broker could be up for up to
+5 s before the connection tried again; and the relay's and consumer's own backoff had grown to its 5 s cap during the
+outage, so even after the connection was back they could wait up to 5 s more before trying. Now the services connect
+with `reconnect_interval=1` (unless the URL says otherwise: `broker.robust_url`), and the workers wait for the
+connection's reconnect as well as their backoff (`broker.reconnects`, an event the robust connection's reconnect
+callback sets), so they start the moment it is back. The event is cleared at the start of each attempt, so a reconnect
+any time after an attempt began ends its backoff, and an old one can't make a worker spin. A test pins every backoff at
+30 s and still sees orders settle within seconds of the broker's return.
+
+**How is the load test's latency measured, and why open loop?**
+Order i is due at start + i / rate and is sent then whatever happened to the others; its end-to-end latency runs from
+its due time to its outcome. A closed loop (each client waiting for its answer before the next order) slows the sender
+down when the target slows down, so a stall shows up as fewer orders rather than as latency: coordinated omission. The
+services' outcome is the `order.confirmed` or `order.cancelled` event, read off the broker by the load test's own queue,
+so it includes the last relay hop; the monolith's is its response. Percentiles are nearest rank, computed in integers.
+The 200 orders before the timed ones are paced the same and not counted, so the first timed order doesn't meet cold
+connections.
+
+**What does the load test check besides speed?**
+The books, after waiting until the services are quiet (outboxes empty, every work and wait queue empty, every
+notification recorded, three times in a row): every order settled exactly once, the `CHARGED` payments' cents equal to
+the `CONFIRMED` orders' totals, the units taken from stock equal to the confirmed orders' units, one notification per
+order, nothing dead-lettered. Every run in the README passed.
+
+**What did the load test show?**
+At 100 orders/s, which both can take, the split costs about 3 ms at the median end to end (60.8 ms against the
+monolith's 58.0 ms, with a 50 ms provider) and has a much better tail (p99 78.5 ms against 135.6 ms): the monolith holds
+the product rows it reserved through the whole provider call, so orders sharing a product queue for each other; the
+order service commits its reservation before the payment even starts. With 64 clients sending as fast as they're
+answered, the monolith settles 130.6 orders/s and its clients just wait (p50 479 ms): its pool of 10 connections, each
+held for a provider call, is the cap. The services accept 359 orders/s but settle 171/s (the payment service holds a
+connection per provider call too, 8 at a time), so the backlog grows and 2,769 of the 10,000 orders reach their 30 s
+deadline and are cancelled and refunded. Nobody is charged for a cancelled order, but it shows the split has lost the
+monolith's natural backpressure.
+
+**So is the split slower or faster?**
+Neither, as a headline. It answers the client 17 times faster (3.4 ms against 58 ms), is about as fast to the outcome,
+and its tail is better because the slow call no longer holds shared locks. Its throughput on this machine is the same
+kind of limit as the monolith's: connections held across a 50 ms provider call. The difference is what happens past the
+limit: the monolith slows everyone down; the services keep saying yes and let the saga's deadline clean up. The README's
+limitations say what would fix it (a cap on orders awaiting payment).
+
+**Why did 2.5 s of idleness after the broker came back cost 8 s?**
+Because of the headroom. While the broker is down, orders keep arriving at 100/s and pile up; once it's back the
+payment service works through the pile at about 145/s, so the pile shrinks by only about 45/s. Every second the
+services stay idle after the restart adds 100 orders to the pile and about 3 s to the time until they've caught up:
+38.6-39.1 s before the fix, 30.9-31.1 s after, from the restart to the last order slower than 1 s. The end-to-end
+median in those runs (1.5 s before, 64 ms after) is a threshold effect of the same catch-up, not a 20-fold speedup.
+
+**How do you trust numbers from a laptop?**
+I don't trust the decimals: two runs of each outage case, the other runs once, every process sharing the same eight
+cores with a video call's encoder alongside. I trust the direction and the mechanisms, each of which has a test: the
+monolith's row lock (day 2's two-orders-one-product test), the payment service's concurrency cap (the prefetch and the
+pool), the reconnect gap (the 30 s-backoff test). The tables are printed by a script from the runs' own JSON files, and
+the outage runs' samples are committed, so every number can be recomputed.
+
+## What went wrong on day 4
+
+- My first drain check in the load test read the books once both outboxes were empty and every order had its
+  notification. A refund can be inside a handler then (its delivery unacknowledged, which no count shows), so a
+  cancelled order's payment could still read `CHARGED`. It now also waits for every queue to be empty, three times in a
+  row half a second apart, and fails the books on any dead letter.
+- The broker-outage numbers first looked like a 20-fold win at the median (1.5 s to 64 ms). A per-10-seconds breakdown
+  showed both runs slow until the backlog cleared and the median order sitting right at that edge, so the README
+  reports the time until the services caught up (39 s to 31 s) instead.
 ## What went wrong on day 3
 
 - The first end-to-end test of 60 orders used the fake provider's per-attempt error coin at 30%: about 1 order in 125
@@ -451,6 +554,6 @@ again: a fix for a timeout needs its own review, because bounding one wait chang
 
 ## What's next
 
-Day 4: contract tests (each consumer's expectations against what its producer writes), failure injection (the broker
-stopped mid-run, every message delivered twice, a provider that times out), and the 10,000-order load test against
-the monolith, with end-to-end latency from order to confirmation.
+Day 5: the release. README and WALKTHROUGH finished, the results gathered, `v1.0.0`. Carry-overs: no dead-letter
+replay tool (a dead-lettered refund leaves a customer charged until replayed), no backpressure on intake (an overload
+becomes timeouts and refunds), a stuck outbox row only reported, never parked.

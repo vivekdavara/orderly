@@ -471,11 +471,11 @@ outbox never does) can't send two e-mails.
 
 | Failure | What happens |
 |---|---|
-| Broker down | Writes still commit (the outbox fills); relays retry with backoff; nothing is lost (day 4 tests it) |
+| Broker down | Writes still commit (the outbox fills); relays and consumers back off and start again when the connection comes back; nothing is lost (day 4: a test cuts it, the load test stops the node) |
 | A service crashes mid-handler | Its transaction rolls back; the message is redelivered |
 | Crash after commit, before ack | Redelivered; deduplicated by `processed_messages` |
 | Crash after publish, before the outbox mark | Re-published with the same id; deduplicated |
-| Duplicate messages | Deduplicated; the day-4 test sends every message twice |
+| Duplicate messages | Deduplicated; a day-4 test sends every message twice, another re-sends both outboxes whole |
 | A handler's transient error (DB, provider) | Retried through the wait queues with backoff, then dead-lettered |
 | An undecodable message | Dead-lettered at once |
 | The payment reply never arrives | The deadline cancels the order and sends a refund |
@@ -485,6 +485,7 @@ outbox never does) can't send two e-mails.
 | A charge fails all its attempts | Dead-lettered; the order times out and its refund voids the order (day 3) |
 | A reply and the deadline at once | Both lock the order's row; the second sees the first's outcome (day 3) |
 | A broker drop under a consumer | It closes its channel for good and subscribes again (day 3) |
+| The provider takes the money and its answer is lost | The handler times out, the command is retried, the provider's idempotent answer confirms it; if every answer is lost, the deadline's void refunds it (day 4) |
 
 ## Data
 
@@ -515,11 +516,57 @@ per order.
 - Contract tests (day 4): each consumer's expectations about a message checked against what its producer writes.
 - Failure injection (day 4): the broker stopped mid-run, every message delivered twice, a provider that times out.
 
+**Contract tests, as built (day 4).** Consumer-driven: each consumer owns `contracts/<consumer>.json`, and for every
+message type it takes (11 interactions over the 7 types) gives an example, `given` (the state its producer must be in
+to send it), the consumer state it expects, `then` (what it does), and `match`: the fields it reads, each `exact` (the
+example's value), `uuid` (any id) or `order` (the order's id). A field not in `match` is one it doesn't read.
+`tests/test_contracts.py` checks each file three ways:
+
+- the contract: well formed, every example a canonical message that `decode` and the published JSON Schema accept,
+  routed by the topology to the consumer's queue and in the consumer's `ACCEPTS`, and every type it takes covered;
+- the consumer: its handler fed the example in the stated state does what `then` says (in a transaction rolled back
+  afterwards); and fed the example with any unlisted field changed to another valid value, it does exactly the same,
+  so `match` can't claim less than the consumer reads;
+- the producer: its own code driven into `given` (the order service's write, its saga steps and sweeper; the payment
+  service's handler with the fake provider) writes a message of that type whose listed fields match.
+
+In one codebase the shapes can't drift (every service decodes with `messages.py`); what the contracts pin is the
+values and the states behind them, and which fields each consumer depends on, so a producer knows what it may change.
+They recorded three things worth knowing: the order service reads only the order id of a success (not the amount), the
+payment service ignores a refund's reason, and nothing reads `order.confirmed`'s `customer_id`.
+
+**Failure injection, as built (day 4)** (`tests/test_failure_injection.py`, the three services in one process, each
+test ending with the books: every order settled, each customer told once, the provider holding exactly the confirmed
+orders' money, the stock what they took):
+
+- **The broker away mid-run**: the services reach RabbitMQ through `tests/chaos.py`, a TCP proxy the test cuts (every
+  connection dropped, reconnects refused) and restores, so "the broker is down" needs no control of the shared node
+  and runs the same in CI. 20 orders settle, the broker goes for 1.5 s while 30 more are taken (201, their charges in
+  the outbox, `/health` 503 on the broker), and all 50 settle once it is back. Another test pins every worker's backoff
+  at 30 s and still sees the orders settle within seconds of the broker's return.
+- **Duplicates**: every relay publishes every message twice (what a relay that crashed between publish and mark does):
+  each consumer handles each message once and skips its copy, the provider is asked once per order. And both outboxes
+  re-sent whole after 30 sagas: nothing changes.
+- **A provider that times out**: the charge goes through, its answer never comes, the handler times out (0.3 s in the
+  test) and the command is retried: the provider's idempotent answer confirms the order, charged once. If every answer
+  is lost, the command is dead-lettered, the deadline cancels the order and its void refunds the money.
+
 ## Measurement (day 4)
 
 A load generator sends 10,000 orders to the monolith and to the services, and reports throughput and end-to-end
 latency (order accepted → confirmed or cancelled) at p50/p95/p99, with the provider's latency fixed and stated. All
 data synthetic; every number with the command that produced it.
+
+**As built (day 4)**: `scripts/load_test.py` starts the target's processes itself (`python -m orderly.service`, real
+HTTP on 8112-8114) on fresh `orderly_load_<service>` databases (100 products, 100,000 units each) and, for the
+services, a topology of its own (`ORDERLY_TOPOLOGY_PREFIX`), deleted afterwards. The orders are fixed by a seed (1-3
+distinct products, 1-3 units each); 200 untimed orders go first, paced the same. Open loop (`--rate`: order i is sent
+at start + i / rate, whatever happened to the others, so a slow target shows up as latency) or closed loop
+(`--concurrency`). End to end runs from the order's due time to its outcome: the monolith's response, or the
+`order.confirmed`/`order.cancelled` event, read off the broker by a queue of the load test's own. At the end it waits
+until the services are quiet (outboxes, every queue) and checks the books in the databases: every order settled once,
+the `CHARGED` cents equal to the `CONFIRMED` totals, the units taken equal to the confirmed units, one notification per
+order, no dead letters. The results are in README.md "Results (day 4)".
 
 ## Days
 

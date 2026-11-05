@@ -8,12 +8,14 @@ the monolith.
 
 Python 3.11, FastAPI, RabbitMQ 4.3 (aio-pika), PostgreSQL 14 (psycopg 3), pytest. MIT licensed.
 
-**Status: day 3 of 5.** Day 1: the design, the message contracts, the RabbitMQ topology, the database schemas and
+**Status: day 4 of 5.** Day 1: the design, the message contracts, the RabbitMQ topology, the database schemas and
 their migrations, the local RabbitMQ and PostgreSQL scripts, CI. Day 2: the monolith baseline, the order service
 extracted from it, and the transactional outbox with its relay. Day 3: the payment and notification services, the saga
 with its compensations (stock released, refunds, a deadline), idempotent consumers, retries through wait queues with
-backoff, and dead letters; an order now goes from `POST /orders` to its e-mail through all three services. Day 4 adds
-contract tests, failure injection and the 10,000-order load test ([DESIGN.md](DESIGN.md) "Days").
+backoff, and dead letters; an order now goes from `POST /orders` to its e-mail through all three services. Day 4:
+consumer-driven contract tests, failure injection (the broker cut mid-run, every message twice, a provider that loses
+its answers), the 10,000-order load test against the monolith, and a fix it found (the services sat idle for seconds
+after a broker restart). Day 5 is the release ([DESIGN.md](DESIGN.md) "Days").
 
 ## Architecture
 
@@ -58,6 +60,7 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `src/orderly/seed.py` | A synthetic catalogue: `python -m orderly.seed orders` |
 | `src/orderly/messages.py` | The contract: a JSON envelope around seven typed payloads; `decode` is strict and says why it refuses, `encode` is canonical |
 | `docs/message-schema.json` | The same contract as a JSON Schema, generated from the code (`scripts/export_message_schema.py`) and checked by tests |
+| `contracts/*.json` | Consumer-driven contracts (day 4): per consumer, each message it takes, the producer state behind it, and the fields it reads; `tests/test_contracts.py` checks both sides |
 | `src/orderly/topology.py` | Exchanges, quorum queues, dead-letter queues, the retry wait queues (1 s, 5 s, 30 s) and bindings as code; `routes()` says where each type goes |
 | `src/orderly/broker.py` | Persistent, mandatory, confirmed publishing on a channel where a returned message is an error |
 | `src/orderly/service.py` | The skeleton every service shares: migrate and declare at startup, `/health` (200 only with its database, schema, broker and workers right), routes and background workers stopped by an event, every connection READ COMMITTED; ports 8112-8114 (the monolith takes 8112) |
@@ -66,6 +69,9 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `scripts/postgres.sh` | Creates, migrates, lists and drops Orderly's databases on the local PostgreSQL 14 (`ORDERLY_PG_PREFIX` renames them) |
 | `scripts/measure_test_fixture.py` | Times CREATE DATABASE against CREATE SCHEMA (why each test gets a schema) |
 | `scripts/measure_relay.py`, `scripts/measure_intake.py` | The relay's throughput by batch size; order intake, monolith against order service, on one hot product |
+| `scripts/load_test.py` | The 10,000-order load test (day 4): the monolith or the three services as processes, open or closed loop, end-to-end latency to the outcome event, the books checked; `--broker-outage` stops the node mid-run; `make load-test` |
+| `results/load/*.json` | The load test runs in the README, as the script wrote them (settings, summary, books) |
+| `tests/chaos.py`, `tests/shop.py` | A TCP proxy in front of RabbitMQ that tests cut and restore; the three services in one process for whole-saga tests |
 | `tests/` | 531 tests: unit, property and integration tests against the real servers, whole sagas through the three services |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
@@ -77,6 +83,7 @@ Needs Python 3.11, RabbitMQ (`brew install rabbitmq`) and a PostgreSQL 14 server
 make venv              # .venv with the package and its dev tools
 make services-up       # scripts/rabbitmq.sh start + scripts/postgres.sh create (databases, migrations)
 make check             # ruff, ruff format --check, mypy --strict, pytest
+make load-test         # the day-4 load test's four runs (about 8 minutes; needs ports 8112-8114 free)
 make services-down     # stop the RabbitMQ node (the databases stay)
 ```
 
@@ -108,8 +115,9 @@ confirmed inside the request:
 ORDERLY_PROVIDER_LATENCY_MS=50 ORDERLY_PROVIDER_DECLINE_RATIO=0.1 .venv/bin/python -m orderly.service monolith
 ```
 
-Settings: `ORDERLY_<SERVICE>_DATABASE_URL`, `ORDERLY_AMQP_URL`, `ORDERLY_POOL_SIZE` (10), `ORDERLY_POOL_TIMEOUT_S`
-(5, at most 5), `ORDERLY_PAYMENT_TIMEOUT_S` (30, the order service's payment deadline), and the fake provider's
+Settings: `ORDERLY_<SERVICE>_DATABASE_URL`, `ORDERLY_AMQP_URL` (the services add `reconnect_interval=1` unless it
+sets one), `ORDERLY_TOPOLOGY_PREFIX` (none; the load test's own topology), `ORDERLY_POOL_SIZE` (10),
+`ORDERLY_POOL_TIMEOUT_S` (5, at most 5), `ORDERLY_PAYMENT_TIMEOUT_S` (30, the order service's payment deadline), and the fake provider's
 `ORDERLY_PROVIDER_LATENCY_MS`, `ORDERLY_PROVIDER_DECLINE_RATIO`, `ORDERLY_PROVIDER_ERROR_RATIO` (0), and the fake
 mailer's `ORDERLY_MAILER_LATENCY_MS`, `ORDERLY_MAILER_FAILURE_RATIO` (0).
 
@@ -127,8 +135,26 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 531 tests in about 2 minutes here (120.5 s for the pytest part of a run at 15:50 on day 3, 516
-tests; 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 3's (156 new):
+`make check` runs 616 tests in about 2 minutes here (128-132 s for the pytest part on day 4; 120.5 s for day 3's
+516, 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 4's (85 new):
+
+- **Contracts** (68, `tests/test_contracts.py`, `contracts/*.json`): 11 interactions, each checked as a contract (well
+  formed; the example a canonical message, valid by the published JSON Schema; routed to its consumer and in its
+  `ACCEPTS`; every type a consumer takes covered), against its consumer (the handler does what `then` says in the stated
+  state; changing any field the contract doesn't list changes nothing it does) and against its producer (the producer's
+  own code, driven into `given`, writes a message whose listed fields match). Three mutants, each failing: the e-mail
+  mentioning the customer id, a declined order announced as timed out, a charge made for another customer.
+- **Failure injection** (6, `tests/test_failure_injection.py`, the three services through `tests/chaos.py`'s proxy):
+  the broker cut for 1.5 s while 30 orders are taken, then all 50 settle once; every message published twice; both
+  outboxes re-sent whole; a charge's answer lost once (charged once) and every time (refunded by the deadline's void);
+  every worker's backoff pinned at 30 s and the orders still settling within seconds of the broker's return. Each ends
+  with the books. Disabling the consumer's `processed_messages` check fails both duplicate tests; the old relay and
+  consumer fail the last one.
+- **The load test's own arithmetic** (5, `tests/test_load_test.py`): nearest-rank percentiles in integers, the orders
+  fixed by the seed and all valid requests, the summary counting only timed orders, the recovery measured from the
+  node's restart. **The skeleton** (6): `ORDERLY_TOPOLOGY_PREFIX` and its refusals; the reconnect interval.
+
+Day 3's:
 
 - **The saga's rules** (54, `tests/test_saga.py`): the full table of 24 (state, input) pairs, each with its outcome,
   status and effects, and which are anomalies; only a step out of awaiting payment changes the status or releases
@@ -243,6 +269,86 @@ Tests that need a server find it at `ORDERLY_AMQP_URL` and `ORDERLY_TEST_DATABAS
 are skipped when it isn't there, except with `ORDERLY_REQUIRE_SERVICES=1` (CI sets it), where a missing server fails
 them. Each test isolates itself on the shared servers: a random prefix on every exchange and queue it declares, and a
 private schema in the test database.
+
+## Results (day 4)
+
+Measured on an Apple M3 laptop (macOS 26.6.2, on AC power, load average 3.0-7.6, with `avconferenced` and a video
+encoder using about a third of a core alongside), PostgreSQL 14.20, RabbitMQ 4.3.6, 15:24-15:45. Synthetic data:
+10,000 timed orders per run (200 untimed before them), each of 1-3 of 100 products, 1-3 units each (`--seed 1`); the
+fake provider at 50 ms per call, declining 10% of orders by id; the services' payment deadline 30 s. Every process on
+the one machine, over loopback HTTP and AMQP. The table is `scripts/results_table.py` over the runs' own
+`results/load/*.json`. Every run's books agreed: every order settled once, the `CHARGED` cents equal to the
+`CONFIRMED` totals, the units taken equal to the confirmed units, one notification per order, nothing dead-lettered.
+
+```bash
+make load-test        # the four runs below: scripts/load_test.py {monolith,services} --orders 10000 {--rate 100,--concurrency 64}
+.venv/bin/python scripts/results_table.py results/load/monolith-rate100.json results/load/services-rate100.json \
+    results/load/monolith-c64.json results/load/services-c64.json
+```
+
+| Target | Loop | Sent/s | Settled/s | Accept ms p50 / p95 / p99 / max | End to end ms p50 / p95 / p99 / max | Outcomes | Books |
+|---|---|---|---|---|---|---|---|
+| monolith | open, 100/s | 99.9 | 99.9 | 57.3 / 102.1 / 134.8 / 264.8 | 58.0 / 102.7 / 135.6 / 265.6 | 8,974 confirmed, 1,026 declined cancelled | agree |
+| services | open, 100/s | 100.0 | 99.9 | 3.4 / 5.7 / 7.9 / 70.6 | 60.8 / 65.8 / 78.5 / 138.0 | 9,001 confirmed, 999 declined cancelled | agree |
+| monolith | closed, 64 clients | 130.6 | 130.6 | 479.4 / 582.4 / 704.2 / 1,055.1 | 479.4 / 582.4 / 704.2 / 1,055.1 | 8,973 confirmed, 1,027 declined cancelled | agree |
+| services | closed, 64 clients | 359.4 | 171.0 | 106.9 / 566.3 / 1,054.0 / 4,885.9 | 20,444.8 / 31,003.8 / 31,238.3 / 31,851.4 | 6,512 confirmed, 719 declined, 2,769 timeout cancelled | agree |
+
+Accept is the POST's latency; end to end runs from the order's due time (open loop) or its send (closed loop) to its
+outcome, which for the services is the `order.confirmed`/`order.cancelled` event read off the broker.
+
+What they say:
+
+- **At a rate both can take (100 orders/s), the split costs 3 ms at the median and halves the tail.** The monolith
+  answers in one request: 58.0 ms median, about one provider call plus its own work. The services answer the POST in
+  3.4 ms and announce the outcome 60.8 ms after it was due: five more hops (outbox, relay, broker, consumer, and back)
+  for about 3 ms. But the monolith's p99 is 135.6 ms against 78.5 ms: it holds every product row it reserved for the
+  whole provider call, so orders sharing a product wait for each other's 50 ms; the services hold no product row
+  across the provider call (it is in another service).
+- **Offered as much as 64 clients can send, the monolith pushes back and the services don't.** The monolith settles
+  130.6 orders/s and its clients simply wait (p50 479 ms): its pool of 10 connections, each held for a provider call,
+  is the limit. The services take 359.4 orders/s, because taking an order no longer waits for the payment, but settle
+  only 171.0/s: the payment service holds a connection per provider call too, 8 at a time (its prefetch), so about 8 /
+  50 ms. The backlog grows, and 2,769 orders reach their 30 s deadline unpaid and are cancelled (`payment_timeout`):
+  2,475 of them had been charged by then and were refunded, 294 declined anyway. Nobody was charged for a cancelled
+  order, but a client of the split needs either backpressure (a limit on orders awaiting payment) or more payment
+  capacity; the monolith's slowness was its backpressure.
+
+**A broker outage** (`--broker-outage 30 10`: `scripts/rabbitmq.sh stop` 30 s into the timed orders, `start` 10 s
+after it returned, about 14 s down in all), at 100 orders/s, before and after the day's fix:
+
+```bash
+.venv/bin/python scripts/load_test.py services --orders 10000 --rate 100 --broker-outage 30 10 \
+    --json results/load/services-outage-after-1.json --samples results/load/samples/services-outage-after-1.csv
+.venv/bin/python scripts/outage_recovery.py results/load/services-outage-after-1.json \
+    results/load/samples/services-outage-after-1.csv     # the recovery numbers (committed samples: .csv.gz)
+```
+
+| Run | Target | Loop | Sent/s | Settled/s | Accept ms p50 / p95 / p99 / max | End to end ms p50 / p95 / p99 / max | Outcomes | Books |
+|---|---|---|---|---|---|---|---|---|
+| before the fix (`077ef11`), run 1 | services | open, 100/s, node stopped at 30 s, back at 44 s | 100.0 | 99.9 | 3.4 / 7.6 / 12.1 / 62.2 | 1,463.5 / 14,881.3 / 16,101.0 / 16,705.6 | 9,017 confirmed, 983 declined cancelled | agree |
+| before the fix, run 2 | services | open, 100/s, node stopped at 30 s, back at 44 s | 100.0 | 99.9 | 3.0 / 8.3 / 11.2 / 48.6 | 1,531.0 / 14,864.6 / 16,099.8 / 16,699.0 | 9,052 confirmed, 948 declined cancelled | agree |
+| after the fix (`346e86b`), run 1 | services | open, 100/s, node stopped at 30 s, back at 44 s | 100.0 | 99.9 | 3.5 / 6.9 / 10.4 / 55.7 | 64.2 / 12,614.8 / 13,803.6 / 14,409.6 | 9,053 confirmed, 947 declined cancelled | agree |
+| after the fix, run 2 | services | open, 100/s, node stopped at 30 s, back at 44 s | 100.0 | 99.9 | 3.7 / 7.1 / 9.2 / 77.0 | 64.2 / 12,612.9 / 13,812.8 / 14,377.5 | 9,012 confirmed, 988 declined cancelled | agree |
+
+| Run | First order settled after the restart | Backlog (orders taken before it) cleared | Caught up (last order over 1 s settled) | Orders over 1 s |
+|---|---|---|---|---|
+| before, run 1 | 2.15 s | 12.10 s | 38.59 s | 5,180 |
+| before, run 2 | 2.97 s | 12.27 s | 39.13 s | 5,180 |
+| after, run 1 | 0.18 s | 9.83 s | 30.89 s | 4,409 |
+| after, run 2 | 0.37 s | 9.97 s | 31.11 s | 4,380 |
+
+- **Nothing was lost**: the orders kept coming in during the outage (201 at a p99 of 9-12 ms, their commands waiting in
+  the outbox) and every one settled once, with the books agreeing, in all four runs.
+- **The fix**: before it, the services sat idle for 2-3 s after the node was back: aio-pika's robust connection retries
+  every 5 s by default, and the relay's and consumer's own backoff had grown to its 5 s cap. Now they reconnect every
+  second and the reconnect itself wakes the workers (`broker.reconnects`), so the first order settles 0.2-0.4 s after
+  the restart.
+- **Why 2.5 s idle cost 8 s**: the backlog drains only as fast as the payment service outpaces the arrivals, about
+  145 - 100 = 45 orders/s, so every second spent idle after the restart adds about 3 s before the services catch up
+  (38.6-39.1 s before, 30.9-31.1 s after). The end-to-end p50 in the table (1.5 s before, 64 ms after) is a threshold
+  effect of the same thing, not a 20-fold speedup: in a 100 s run with a 14 s outage the median order sits right at the
+  end of the catch-up.
+- These are two runs each on a laptop with other work running; the direction is clear, the decimals aren't.
 
 ## Results (day 3)
 
@@ -439,6 +545,17 @@ connection and with the lock already held, `-1` really meaning no limit, cleanup
   requeue on a persistent error loops forever; a wait queue per delay gives backoff without a plugin.
 - **The consumer owns its recovery**: on any close of its channel it closes it for good and subscribes again, rather
   than trusting aio-pika's robust channel to restore a subscription it doesn't know about.
+- **Contracts owned by the consumers, checked on both sides** (day 4): each consumer's file says which fields it reads;
+  its own test proves it reads no others (changing them changes nothing), and the producer's proves it sends them.
+  Plain JSON and pytest rather than a contract framework: one repo, three consumers, and the check that matters (the
+  producer's real code in a named state) is ordinary test code.
+- **The broker cut by a proxy in tests, stopped for real in the load test**: a proxy keeps tests independent of each
+  other and of the CI service container; stopping the node is the harsher case (forced closes, recovery from disk).
+- **Open loop, measured to the outcome event, books checked after every run**: a closed loop hides a stall as a slower
+  sender; the services' "done" is the event a subscriber sees, not the 201; and a fast run that loses an order is a
+  failure, so every run ends with the databases agreeing or it says so.
+- **Workers wake on the reconnect, not only on their backoff** (day 4): a backoff exists to spare a broker that's down,
+  so once the connection is back there is nothing left to wait for.
 
 ## Limitations
 
@@ -448,7 +565,18 @@ connection and with the lock already held, `-1` really meaning no limit, cleanup
   replayed message's first failure dead-letters it again.
 - The confirmation e-mail is at least once: a crash between the send and the commit sends it again.
 - The payment service holds a database connection for each provider call in flight (8 at most per instance, the
-  consumer's prefetch), so a slow provider limits its throughput to 8 / latency per instance.
+  consumer's prefetch), so a slow provider limits its throughput to 8 / latency per instance: about 160 orders/s at
+  50 ms (171 settled/s measured on day 4, timeouts included).
+- **No backpressure on intake**: the order service takes orders as fast as it can write them (359/s with 64 clients),
+  whatever the payment service can charge, so an overload turns into payment timeouts and refunds (2,769 of 10,000
+  orders in the day-4 closed-loop run), not into slower answers. A cap on orders awaiting payment, answered `429` or
+  `503` above it, would push back like the monolith does.
+- The load test runs every process (three services, PostgreSQL, RabbitMQ, the generator) on one laptop over loopback:
+  the numbers include their contention for the same cores and no network latency.
+- The outage the load test injects stops the only node; with a cluster, quorum queues would fail over instead, which
+  isn't measured.
+- The contracts live in this repo next to both sides. Split into separate repos, they would need publishing to where
+  each producer's CI can fetch them (what a contract broker does).
 - The sweeper looks every second, so an order is cancelled up to a second after its deadline.
 - Anomalies (replies the protocol rules out) are only logged, not counted or alerted on.
 - The monolith's flaws are deliberate (it is the baseline): a failure after the charge leaves the charge, and its retry
