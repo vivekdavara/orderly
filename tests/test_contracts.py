@@ -189,6 +189,31 @@ def without_ids(message: Message, order_id: uuid.UUID) -> tuple[str, dict[str, A
     }
 
 
+TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z")
+
+
+def scalars(value: Any) -> set[Any]:
+    if isinstance(value, dict):
+        return {v for item in value.values() for v in scalars(item)}
+    return {value}
+
+
+def as_written(message: Message, incoming: dict[str, Any]) -> dict[str, Any]:
+    """Everything in a message the consumer wrote, envelope included, for comparing two runs: a value copied from the
+    incoming message stays as it is (so changing that field shows), and an id or time that is new on every run (its
+    own id, its time, a new payment's id) becomes "<fresh>". Day-4 review: comparing only the type and the payload
+    missed a consumer that stamped its reply with the command's occurred_at."""
+    copied = scalars(incoming)
+
+    def seen(value: Any) -> Any:
+        if value in copied or not isinstance(value, str):
+            return value
+        return "<fresh>" if UUID.fullmatch(value) or TIME.fullmatch(value) else value
+
+    sent: dict[str, Any] = json.loads(encode(message))
+    return {k: {pk: seen(pv) for pk, pv in v.items()} if k == "payload" else seen(v) for k, v in sent.items()}
+
+
 ORDER_ROW = {"customer_id": "c-42", "email": "ada@example.com", "total_cents": 5198, "currency": "USD"}
 
 
@@ -219,10 +244,12 @@ async def consume(interaction: Interaction, message: dict[str, Any], url: str) -
             await payments.apply(conn, decoded, provider)
             row = await payments.read_payment(conn, order_id)
             assert row is not None
+            replies = await outbox_after(conn, after)
             return {
                 "provider": provider.calls,
                 "payment": (row.status, row.amount_cents, row.currency),
-                "replies": [without_ids(m, order_id) for m in await outbox_after(conn, after)],
+                "replies": [without_ids(m, order_id) for m in replies],
+                "envelopes": [as_written(m, message) for m in replies],
             }
         if interaction.consumer == "orders":
             await conn.execute("INSERT INTO products VALUES ('WIDGET-1', 'Widget', 2599, 'USD', 100)")
@@ -241,10 +268,12 @@ async def consume(interaction: Interaction, message: dict[str, Any], url: str) -
             ).fetchone()
             stock_row = await (await conn.execute("SELECT stock FROM products")).fetchone()
             assert order is not None and stock_row is not None
+            written = await outbox_after(conn, 0)
             return {
                 "order": tuple(order),
                 "stock": stock_row[0],
-                "written": [without_ids(m, order_id) for m in await outbox_after(conn, 0)],
+                "written": [without_ids(m, order_id) for m in written],
+                "envelopes": [as_written(m, message) for m in written],
             }
         assert interaction.consumer == "notifications" and interaction.consumer_state is None
         mailer = FakeMailer()
@@ -351,7 +380,8 @@ async def test_the_consumer_does_what_its_contract_says(interaction: Interaction
         kind = "order_confirmed" if interaction.type == "order.confirmed" else "order_cancelled"
         assert effects["rows"] == [(interaction.order_id, kind)]
     else:
-        assert effects == expected_then(interaction)
+        # What `then` says is about the effects; the envelopes are for the next test.
+        assert {k: v for k, v in effects.items() if k != "envelopes"} == expected_then(interaction)
 
 
 # A different valid value for every field a consumer might not read; a field with none fails the next test.
