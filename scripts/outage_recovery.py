@@ -25,7 +25,8 @@ def main(run_path: str, samples_path: str) -> None:
     raw = Path(samples_path).read_bytes()
     text = gzip.decompress(raw).decode() if samples_path.endswith(".gz") else raw.decode()
     pairs = [
-        (float(row["due"]), float(row["outcome_at"]) if row["outcome_at"] else 0.0)
+        # A refusal by the awaiting cap is an answer, not an order settling (as in load_test.summarize).
+        (float(row["due"]), float(row["outcome_at"]) if row["outcome_at"] and row["outcome"] != "REFUSED" else 0.0)
         for row in csv.DictReader(io.StringIO(text))
     ]
     print(json.dumps(load_test.recovery(pairs, run["outage"])))

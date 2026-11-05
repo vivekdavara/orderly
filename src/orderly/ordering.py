@@ -235,7 +235,7 @@ class Taken:
 
 async def take_order(pool: AsyncConnectionPool, request: OrderRequest, key: str | None, write: Write) -> Taken:
     """Reserve, write and commit an order, or replay the one its key already made. Raises OrderRefused (nothing
-    written) for an order that can't be taken."""
+    written) for an order that can't be taken, or Overloaded (nothing written) past the order service's awaiting cap."""
     fingerprint = request.fingerprint()
     # Twice at most: a unique violation on the key means a request with it committed, so the second pass replays it.
     for _ in range(2):

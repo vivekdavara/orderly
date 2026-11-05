@@ -287,3 +287,10 @@ def test_the_awaiting_cap_comes_from_the_environment(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("ORDERLY_MAX_AWAITING_PAYMENT", "0")
     with pytest.raises(ValueError, match="at least 1"):
         orders.max_awaiting_from_environment()
+
+
+def test_a_cap_below_one_is_refused_by_create_app_too() -> None:
+    """Round 2 of the day-4 review: the environment variable refused 0, create_app(max_awaiting=0) didn't, and 0 would
+    turn every order away."""
+    with pytest.raises(ValueError, match="max_awaiting must be at least 1"):
+        orders.create_app(Settings("orders", "", ""), max_awaiting=0)

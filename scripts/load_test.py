@@ -338,7 +338,7 @@ async def drive(
             for sample in samples:
                 if sample.order_id in outcomes.seen:
                     sample.outcome_at, sample.outcome = outcomes.seen[sample.order_id]
-        last = max((s.outcome_at for s in run.samples if s.outcome_at), default=sent_done)
+        last = max((s.outcome_at for s in run.samples if s.outcome_at and s.order_id), default=sent_done)
         run.settle_seconds = last - timed_t0
         run.accepted_all = sum(1 for s in samples if s.order_id)
 
@@ -522,7 +522,9 @@ def summarize(run: Run) -> dict[str, Any]:
     }
     if run.outage and timed:
         origin = timed[0].due
-        pairs = [(s.due - origin, s.outcome_at - origin if s.outcome_at else 0.0) for s in timed]
+        # A refusal by the awaiting cap is an answer, not an order settling (day-4 review, round 2: the order service
+        # answers those from PostgreSQL alone, so they made the services look recovered while the broker was down).
+        pairs = [(s.due - origin, s.outcome_at - origin if s.outcome_at and s.order_id else 0.0) for s in timed]
         summary["recovery"] = recovery(pairs, run.outage)
     # How long the cap took to say no (answered - sent of the orders it refused).
     refused = sorted(s.answered - s.sent for s in timed if s.outcome == "REFUSED")
@@ -552,6 +554,8 @@ async def main() -> int:
     parser.add_argument("--samples", type=Path, help="write every timed order here, as CSV (times in seconds)")
     parser.add_argument("--log-dir", type=Path, default=ROOT / ".load")
     args = parser.parse_args()
+    if args.max_awaiting is not None and args.max_awaiting < 1:
+        parser.error("--max-awaiting must be at least 1")
     if args.broker_outage and args.target != "services":
         parser.error("--broker-outage needs the services: the monolith doesn't use the broker")
 

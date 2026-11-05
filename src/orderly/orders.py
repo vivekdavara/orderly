@@ -255,6 +255,8 @@ def create_app(
     """`max_awaiting` caps the orders awaiting payment (default: ORDERLY_MAX_AWAITING_PAYMENT, else none)."""
     timeout = payment_timeout_from_environment() if payment_timeout is None else payment_timeout
     cap = max_awaiting_from_environment() if max_awaiting is None else max_awaiting
+    if cap is not None and cap < 1:
+        raise ValueError(f"max_awaiting must be at least 1, not {cap}")  # 0 would refuse every order
     consumers: list[Consumer] = []
 
     async def relay(resources: Resources, stop: asyncio.Event) -> None:

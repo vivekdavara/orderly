@@ -3,7 +3,8 @@ transaction writes (`write_for`) and what status code an order's state answers w
 
     POST /orders         body: OrderRequest; optional Idempotency-Key header
                          201/402 the order (402: the monolith's decline); "Idempotent-Replayed: true" on a replay
-                         409 out of stock, 422 a malformed request, an unknown sku or a reused key, 503 a dependency
+                         409 out of stock, 422 a malformed request, an unknown sku or a reused key, 503 (with
+                         Retry-After) a dependency down, the database busy, or the order service's awaiting cap
     GET  /orders/{id}    200 the order, 404
 """
 
@@ -29,7 +30,8 @@ def router(
     unavailable: Mapping[type[Exception], str] | None = None,
 ) -> APIRouter:
     """`write_for(request, key)` gives the write for one request; `unavailable` maps the exceptions of a dependency
-    that is down (the provider, the mailer) to the error name of a 503, which tells the client to retry. A request
+    that is down (the provider, the mailer), or of a service that is full (the order service's awaiting cap), to the
+    error name of a 503, which tells the client to retry. A request
     that waited the pool's timeout for a database connection is a 503 too, rather than a 500."""
     errors: dict[type[Exception], str] = {PoolTimeout: "database_busy", **(unavailable or {})}
     routes = APIRouter()
