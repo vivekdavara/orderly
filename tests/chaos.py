@@ -39,7 +39,11 @@ class Proxy:
 
     async def start(self) -> None:
         """Listen on 127.0.0.1 (a free port the first time, the same port after a cut)."""
-        self._server = await asyncio.start_server(self._accept, "127.0.0.1", self.port)
+        # The cut count is read when the connection is accepted (connection_made calls this lambda at once), not in the
+        # handler's first step, which a cut in the same loop iteration can run before (day-4 review, round 2).
+        self._server = await asyncio.start_server(
+            lambda reader, writer: self._accept(reader, writer, self._cuts), "127.0.0.1", self.port
+        )
         self.port = self._server.sockets[0].getsockname()[1]
 
     def url(self, amqp_url: str) -> str:
@@ -73,9 +77,12 @@ class Proxy:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
-    async def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, cuts: int) -> None:
         self.accepted += 1
-        cuts = self._cuts
+        if self._cuts != cuts:  # cut between the accept and this handler's first step
+            writer.transport.abort()
+            self.dropped += 1
+            return
         try:
             up_reader, up_writer = await asyncio.open_connection(self.target_host, self.target_port)
         except OSError:
