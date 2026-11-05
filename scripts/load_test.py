@@ -477,7 +477,9 @@ def summarize(run: Run) -> dict[str, Any]:
         origin = timed[0].due
         pairs = [(s.due - origin, s.outcome_at - origin if s.outcome_at else 0.0) for s in timed]
         summary["recovery"] = recovery(pairs, run.outage)
-    for name, values in (("accept_ms", accept), ("end_to_end_ms", e2e)):
+    # How long the cap took to say no (answered - sent of the orders it refused).
+    refused = sorted(s.answered - s.sent for s in timed if s.outcome == "REFUSED")
+    for name, values in (("accept_ms", accept), ("end_to_end_ms", e2e), ("refused_ms", refused)):
         if values:
             summary[name] = {f"p{p}": round(percentile(values, p) * 1000, 1) for p in (50, 95, 99)} | {
                 "max": round(values[-1] * 1000, 1)

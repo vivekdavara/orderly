@@ -89,3 +89,26 @@ def test_a_run_fails_when_an_order_is_lost_or_the_books_disagree() -> None:
     assert load_test.failures(run, good | {"settled": 2}) == ["1 accepted orders never settled"]
     run.books = {"ok": False}
     assert load_test.failures(run, good) == ["the books disagree: {'ok': False}"]
+
+
+def test_the_refusals_are_counted_and_timed_apart_from_the_accepted_orders() -> None:
+    run = load_test.Run("services", 3, 0, 10.0, None, 50.0, 0.1, 30.0, 1, max_awaiting=1)
+    run.samples = [
+        load_test.Sample(
+            0, due=1.0, sent=1.0, answered=1.004, status_code=201, order_id="a", outcome_at=1.06, outcome="CONFIRMED"
+        ),
+        load_test.Sample(1, due=1.1, sent=1.1, answered=1.102, status_code=503, outcome_at=1.102, outcome="REFUSED"),
+        load_test.Sample(2, due=1.2, sent=1.2, answered=1.21, status_code=503, outcome_at=1.21, outcome="REFUSED"),
+    ]
+    run.send_seconds, run.settle_seconds = 0.3, 0.06
+    summary = load_test.summarize(run)
+    assert (summary["accepted"], summary["refused"], summary["settled"]) == (1, 2, 1)
+    assert summary["outcomes"] == {"CONFIRMED": 1}
+    assert summary["accept_ms"]["max"] == 4.0 and summary["refused_ms"] == {
+        "p50": 2.0,
+        "p95": 10.0,
+        "p99": 10.0,
+        "max": 10.0,
+    }
+    run.books = {"ok": True}
+    assert load_test.failures(run, summary) == []
