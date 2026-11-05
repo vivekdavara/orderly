@@ -421,6 +421,25 @@ def books(run: Run) -> dict[str, Any]:
     return result
 
 
+def recovery(samples: list[tuple[float, float]], outage: dict[str, float]) -> dict[str, Any]:
+    """How the services came back from --broker-outage, from (due, outcome_at) pairs in seconds since the first timed
+    order (0 for no outcome) and the outage's times on the same clock. `started_at` is when scripts/rabbitmq.sh start
+    returned, with the node accepting connections."""
+    if "started_at" not in outage:
+        return {}
+    back, stopped = outage["started_at"], outage["stopped_at"]
+    outcomes = sorted(at for _, at in samples if at)
+    after = [at for at in outcomes if at > back]
+    waited = [at for due, at in samples if due < back and at]
+    return {
+        "outcomes_while_stopped": sum(1 for at in outcomes if stopped < at <= back),
+        # The first order to settle once the node was back: how long the services took to notice.
+        "first_outcome_after_restart_s": round(after[0] - back, 2) if after else None,
+        # When the last order taken before the restart had settled: the backlog cleared.
+        "backlog_cleared_after_restart_s": round(max(waited) - back, 2) if waited else None,
+    }
+
+
 def summarize(run: Run) -> dict[str, Any]:
     timed = run.samples
     ok = [s for s in timed if s.order_id]
@@ -434,6 +453,10 @@ def summarize(run: Run) -> dict[str, Any]:
         "sent_per_s": round(run.orders / run.send_seconds, 1) if run.send_seconds else None,
         "settled_per_s": round(len(e2e) / run.settle_seconds, 1) if run.settle_seconds else None,
     }
+    if run.outage and timed:
+        origin = timed[0].due
+        pairs = [(s.due - origin, s.outcome_at - origin if s.outcome_at else 0.0) for s in timed]
+        summary["recovery"] = recovery(pairs, run.outage)
     for name, values in (("accept_ms", accept), ("end_to_end_ms", e2e)):
         if values:
             summary[name] = {f"p{p}": round(percentile(values, p) * 1000, 1) for p in (50, 95, 99)} | {

@@ -59,3 +59,15 @@ def test_the_summary_counts_only_the_timed_orders(target: str) -> None:
     assert summary["outcomes"] == {"CONFIRMED": 1, "CANCELLED:payment_declined": 1}
     assert summary["end_to_end_ms"] == {"p50": 60.0, "p95": 100.0, "p99": 100.0, "max": 100.0}
     assert summary["settled_per_s"] == 10.0
+
+
+def test_recovery_is_measured_from_the_nodes_restart() -> None:
+    outage = {"stopped_at": 10.0, "stop_returned_at": 11.5, "started_at": 20.0}
+    # (due, outcome_at): settled before the stop; settled while stopped; waited, settled after; never settled; after.
+    samples = [(1.0, 1.06), (9.9, 10.5), (12.0, 21.5), (15.0, 23.25), (18.0, 0.0), (21.0, 21.07)]
+    assert load_test.recovery(samples, outage) == {
+        "outcomes_while_stopped": 1,
+        "first_outcome_after_restart_s": 1.07,
+        "backlog_cleared_after_restart_s": 3.25,
+    }
+    assert load_test.recovery(samples, {}) == {}
