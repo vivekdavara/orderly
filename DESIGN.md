@@ -567,7 +567,7 @@ at start + i / rate, whatever happened to the others, so a slow target shows up 
 `order.confirmed`/`order.cancelled` event, read off the broker by a queue of the load test's own. At the end it waits
 until the services are quiet (outboxes, every queue) and checks the books in the databases: every order settled once,
 the `CHARGED` cents equal to the `CONFIRMED` totals, the units taken equal to the confirmed units, one notification per
-order, no dead letters. The results are in README.md "Results (day 4)".
+order, no dead letters, and (since the day-4 review) every order against its own payment and notifications. The results are in README.md "Results (day 4)".
 
 **The awaiting cap (day 4)**, added because of the load test: with 64 clients the order service took 359 orders/s
 while the payment service charged about 171/s, and 2,769 of 10,000 orders waited out their deadline. With

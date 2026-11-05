@@ -136,8 +136,8 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 625 tests in about 2 minutes here (124-132 s for the pytest part on day 4; 120.5 s for day 3's
-516, 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 4's (94 new):
+`make check` runs 629 tests in about 2 minutes here (124-132 s for the pytest part on day 4; 120.5 s for day 3's
+516, 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 4's (98 new):
 
 - **Contracts** (68, `tests/test_contracts.py`, `contracts/*.json`): 11 interactions, each checked as a contract (well
   formed; the example a canonical message, valid by the published JSON Schema; routed to its consumer and in its
@@ -159,7 +159,8 @@ Erlang distribution (25673) and epmd to loopback.
   node's restart, refusals counted and timed apart, the exit status. **The skeleton** (7): `ORDERLY_TOPOLOGY_PREFIX`
   and its refusals; the reconnect interval, in the URL and on a running service's connection. **The review's** (3,
   `tests/review_d4/`): the proxy's cut race and the contracts' envelope blind spot (each failed 3 of 3 before its
-  fix), and the open loop timed from the due times (kills three load-test mutants).
+  fix), and the open loop timed from the due times (kills three load-test mutants); round 2's (2,
+  `tests/review_d4r2/`), each failing 3 of 3 before its fix.
 
 Day 3's:
 
@@ -462,12 +463,29 @@ books expected every order sent, so it waited out its 120 s and the books said "
 makes "first order settled after the restart" an upper bound. Its mutants: three of the load test survived its unit
 tests (end to end from the send instead of the due time, the warm-ups kept, the send time recorded as the due time);
 its test of the open loop against a fake client (`tests/review_d4/`) kills all three. Dropping `robust_url` from the
-services' start-up survived too; `test_a_running_service_reconnects_every_second` kills it. Not acted on: the books
-compare sums (confirmed cents against charged cents, units taken against units confirmed), so two offsetting errors
-would pass; `outcomes_while_stopped` counts from the stop request, not from the node being down. What held: no lost
+services' start-up survived too; `test_a_running_service_reconnects_every_second` kills it. Also from its suspicions: the books compared
+sums (confirmed cents against charged cents, units taken against units confirmed), so two offsetting errors would
+pass; they now check every order against its own payment and notifications too (the runs in the tables above were
+checked by the sums; smoke runs since pass both). Not acted on: `outcomes_while_stopped` counts from the stop request, not from the node being down. What held: no lost
 or spinning wake-up in `broker.reconnects` (aio-pika calls the callback after restoring channels; the event is set
 through the attempt's error); the outage test really puts every worker in its 30 s backoff; every recovery number in
 this README recomputes from the committed samples.
+
+**Round 2** (one agent at `07addae`, 16:12-16:25, ~210k tokens, "what did the fixes break, and is the cap right?"):
+two defects, both in the day's own fixes, each test failing 3 of 3 before and passing after:
+
+| Defect | Fix |
+|---|---|
+| The recovery numbers counted the cap's 503s as orders that settled: with `--max-awaiting` and `--broker-outage` together, refusals answered from PostgreSQL while the node was down would make the services look recovered at once | only accepted orders' outcomes go to `recovery()`, in the run and in `outage_recovery.py` (`d3acef6`) |
+| `ceb2acd` read the proxy's cut count in the handler's first step, which a cut in the same loop iteration could run before, so a connection accepted just before the cut still went through | the count is passed by the accept callback itself, and checked first (`70b8927`) |
+
+Also from it: `create_app(max_awaiting=0)` refused like the environment's 0; the docstrings name the cap's 503. What
+held: a refusal by the cap writes nothing (stock, order, lines, outbox, key); the count never includes the request's
+own order, and a same-key twin is always committed before it; `Overloaded` can't reach the monolith; the 503's body is
+what the load test matches. Its surviving mutants are in `wait_drained`, `books` and `accepted_all`, which no unit
+test covers (they need the load databases and a broker): a test with fakes for them is day 5's. Not acted on: the
+envelope check catches copied values but not ones derived from an unlisted field (a time plus a microsecond); a
+handler in flight is invisible to the drain check, which could only make the books fail, not pass.
 
 ## Review of day 3
 

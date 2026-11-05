@@ -535,7 +535,10 @@ whose upstream connect was still in flight (so a reconnect at the moment of a cu
 broker), and the contracts' "unlisted fields don't matter" check compared what a consumer wrote without its envelope
 (so a consumer copying the command's `occurred_at` into its reply would have passed). Both fixed, each with the
 reviewer's failing test. Its suspicion that a drain timing out still looked quiet was real, and my own first capped run
-tripped over the same code; its three surviving load-test mutants are now killed by its open-loop test.
+tripped over the same code; its three surviving load-test mutants are now killed by its open-loop test. A second round
+on the fixes found two more, both in those fixes: the recovery numbers would have counted the cap's 503s as settled
+orders, and the proxy fix still missed a connection accepted in the same loop step as the cut. Round 2 finding bugs in
+round 1's fixes is the usual pattern, which is why there's a round 2.
 
 ## What went wrong on day 4
 
@@ -582,4 +585,4 @@ tripped over the same code; its three surviving load-test mutants are now killed
 Day 5: the release. README and WALKTHROUGH finished, the results gathered, `v1.0.0`. Carry-overs: no dead-letter
 replay tool (a dead-lettered refund leaves a customer charged until replayed), backpressure only opt-in (an overload
 becomes timeouts and refunds unless the opt-in cap is set, and its number is picked by hand), a stuck outbox row only
-reported, never parked.
+reported, never parked; `wait_drained` and `books` have no unit test of their own.
