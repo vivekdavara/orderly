@@ -55,7 +55,7 @@ from orderly.broker import amqp_url
 from orderly.messages import OrderCancelled, decode
 from orderly.migrate import migrate
 from orderly.seed import seed
-from orderly.topology import Topology
+from orderly.topology import QUEUES, Topology
 
 ROOT = Path(__file__).resolve().parents[1]
 ADMIN_URL = os.environ.get("ORDERLY_LOAD_ADMIN_URL", "postgresql://localhost:5432/postgres")
@@ -330,25 +330,47 @@ async def drive(
         run.settle_seconds = last - timed_t0
 
 
-def wait_drained(run: Run, timeout: float = 120.0) -> None:
-    """Until the outboxes are empty and every order's notification is recorded (the services only)."""
+async def queue_depths(topology: Topology) -> dict[str, int]:
+    """Messages ready in each of the topology's queues: work, wait (retry) and dead-letter."""
+    names = []
+    for spec in QUEUES:
+        names += [topology.queue(spec.name), topology.dead_letter_queue(spec.name)]
+        names += [topology.retry_queue(spec.name, delay) for delay in topology.retry_delays]
+    connection = await aio_pika.connect(amqp_url())
+    async with connection, connection.channel() as channel:
+        return {
+            name: (await channel.declare_queue(name, passive=True)).declaration_result.message_count or 0
+            for name in names
+        }
+
+
+async def wait_drained(run: Run, topology: Topology, timeout: float = 120.0) -> dict[str, int]:  # noqa: ASYNC109
+    """Until nothing is left to do (the services only): both outboxes empty, every queue empty, every order's
+    notification recorded, three times in a row half a second apart (a handler in flight holds its delivery unacked,
+    which no count shows, for about a provider call). Returns the dead-letter queues' counts."""
     if run.target != "services":
-        return
+        return {}
     total = run.warmup + run.orders
     deadline = time.monotonic() + timeout
+    quiet = 0
+    depths: dict[str, int] = {}
     while time.monotonic() < deadline:
-        counts = []
+        unpublished = 0
         for service in ("orders", "payments"):
             with psycopg.connect(load_url(service)) as conn:
                 row = conn.execute("SELECT count(*) FROM outbox WHERE published_at IS NULL").fetchone()
-                counts.append(row[0] if row else -1)
+                unpublished += row[0] if row else 1
         with psycopg.connect(load_url("notifications")) as conn:
             row = conn.execute("SELECT count(*) FROM notifications").fetchone()
             told = row[0] if row else -1
-        if counts == [0, 0] and told >= total:
-            return
-        time.sleep(0.5)
-    print("warning: the outboxes or notifications never drained", file=sys.stderr)
+        depths = await queue_depths(topology)
+        busy = {name: n for name, n in depths.items() if n and not name.endswith(".dlq")}
+        quiet = quiet + 1 if unpublished == 0 and not busy and told >= total else 0
+        if quiet == 3:
+            return {name: n for name, n in depths.items() if name.endswith(".dlq")}
+        await asyncio.sleep(0.5)
+    print("warning: the services never went quiet", file=sys.stderr)
+    return {name: n for name, n in depths.items() if name.endswith(".dlq")}
 
 
 def books(run: Run) -> dict[str, Any]:
@@ -468,8 +490,11 @@ async def main() -> None:
             outcomes = Outcomes(topology)
             await outcomes.start()
         await drive(run, bodies, outcomes, tuple(args.broker_outage) if args.broker_outage else None)
-        wait_drained(run)
+        dead_lettered = await wait_drained(run, topology)
         run.books = books(run)
+        if run.target == "services":
+            run.books["dead_lettered"] = dead_lettered
+            run.books["ok"] = run.books["ok"] and not any(dead_lettered.values())
     finally:
         stop_processes(processes)
         if outcomes is not None:
