@@ -22,6 +22,7 @@ sending its next order when the last one is answered.
 
 At the end it checks the books in the databases (every order settled once, payments matching outcomes, stock
 matching the confirmed orders, one notification per order) and prints one table; `--json` also writes everything.
+It exits 1 if an order was refused or never settled or the books disagree (CI runs a 500-order smoke of each target).
 `--broker-outage START SECONDS` stops the local RabbitMQ node (scripts/rabbitmq.sh) START seconds into the timed
 orders and starts it again SECONDS later. All data synthetic.
 """
@@ -472,7 +473,7 @@ def summarize(run: Run) -> dict[str, Any]:
     return summary
 
 
-async def main() -> None:
+async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("target", choices=TARGETS)
     parser.add_argument("--orders", type=int, default=10_000)
@@ -561,7 +562,24 @@ async def main() -> None:
                         sample.error,
                     ]
                 )
+    problems = failures(run, summary)
+    for problem in problems:
+        print(f"FAILED: {problem}", file=sys.stderr)
+    return 1 if problems else 0
+
+
+def failures(run: Run, summary: dict[str, Any]) -> list[str]:
+    """Why the run doesn't count (an exit status of 1): an order refused or lost, an outcome missing, the books
+    disagreeing. Slow is not a failure; wrong is."""
+    problems = []
+    if summary["accepted"] != run.orders:
+        problems.append(f"{run.orders - summary['accepted']} of {run.orders} orders not accepted: {summary['errors']}")
+    if summary["settled"] != summary["accepted"]:
+        problems.append(f"{summary['accepted'] - summary['settled']} accepted orders never settled")
+    if not run.books.get("ok"):
+        problems.append(f"the books disagree: {run.books}")
+    return problems
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))

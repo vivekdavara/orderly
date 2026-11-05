@@ -74,3 +74,16 @@ def test_recovery_is_measured_from_the_nodes_restart() -> None:
         "orders_slower_than_1s": 2,
     }
     assert load_test.recovery(samples, {}) == {}
+
+
+def test_a_run_fails_when_an_order_is_lost_or_the_books_disagree() -> None:
+    run = load_test.Run("services", 3, 0, 10.0, None, 50.0, 0.1, 30.0, 1)
+    run.books = {"ok": True}
+    good = {"accepted": 3, "settled": 3, "errors": {}}
+    assert load_test.failures(run, good) == []
+    assert load_test.failures(run, good | {"accepted": 2, "settled": 2, "errors": {"HTTP 503": 1}}) == [
+        "1 of 3 orders not accepted: {'HTTP 503': 1}"
+    ]
+    assert load_test.failures(run, good | {"settled": 2}) == ["1 accepted orders never settled"]
+    run.books = {"ok": False}
+    assert load_test.failures(run, good) == ["the books disagree: {'ok': False}"]

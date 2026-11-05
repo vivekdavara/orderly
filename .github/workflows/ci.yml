@@ -60,6 +60,10 @@ jobs:
         run: mypy
       - name: Test
         run: pytest
+      - name: Load test smoke (500 orders through each target as processes; exits 1 unless the books agree)
+        run: |
+          python scripts/load_test.py services --orders 500 --warmup 20 --rate 50
+          python scripts/load_test.py monolith --orders 500 --warmup 20 --rate 50
       - name: Create and migrate the service databases with the script
         run: |
           PYTHON=python scripts/postgres.sh create
