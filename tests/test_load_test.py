@@ -69,5 +69,8 @@ def test_recovery_is_measured_from_the_nodes_restart() -> None:
         "outcomes_while_stopped": 1,
         "first_outcome_after_restart_s": 1.07,
         "backlog_cleared_after_restart_s": 3.25,
+        # The slow ones: (12.0, 21.5) and (15.0, 23.25); (9.9, 10.5) took 0.6 s.
+        "caught_up_after_restart_s": 3.25,
+        "orders_slower_than_1s": 2,
     }
     assert load_test.recovery(samples, {}) == {}

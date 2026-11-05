@@ -63,6 +63,8 @@ TARGETS = {"services": ("orders", "payments", "notifications"), "monolith": ("mo
 PORTS = {"orders": 8112, "payments": 8113, "notifications": 8114, "monolith": 8112}
 PRODUCTS = 100
 STOCK = 100_000
+# An order slower than this end to end is one an outage held up (the steady state's p99 is under 0.15 s).
+SLOW = 1.0
 
 
 def percentile(sorted_values: list[float], p: int) -> float:
@@ -431,12 +433,17 @@ def recovery(samples: list[tuple[float, float]], outage: dict[str, float]) -> di
     outcomes = sorted(at for _, at in samples if at)
     after = [at for at in outcomes if at > back]
     waited = [at for due, at in samples if due < back and at]
+    slow = [at for due, at in samples if at and at - due > SLOW]
     return {
         "outcomes_while_stopped": sum(1 for at in outcomes if stopped < at <= back),
         # The first order to settle once the node was back: how long the services took to notice.
         "first_outcome_after_restart_s": round(after[0] - back, 2) if after else None,
         # When the last order taken before the restart had settled: the backlog cleared.
         "backlog_cleared_after_restart_s": round(max(waited) - back, 2) if waited else None,
+        # When the last order slower than SLOW settled: caught up, the orders taken after the restart included (they
+        # queue behind the backlog, which drains only as fast as the payment service outpaces the arrivals).
+        "caught_up_after_restart_s": round(max(slow) - back, 2) if slow else None,
+        "orders_slower_than_1s": len(slow),
     }
 
 
