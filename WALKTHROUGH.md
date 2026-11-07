@@ -3,7 +3,35 @@
 The questions an interviewer is likely to ask about this project, with short answers grounded in the code. Day 1
 covers the design, the message contracts, the RabbitMQ topology, the migrations and the scripts; day 2 the monolith,
 taking an order, the order service and the outbox; day 3 the payment and notification services and the saga; day 4
-the contract tests, failure injection and the load test.
+the contract tests, failure injection and the load test; day 5 the dead-letter tool and the release (`v1.0.0`).
+
+## In two minutes
+
+The pitch, if asked to walk through the project end to end:
+
+1. **The problem.** One order-taking monolith charges the card inside the request's database transaction, so a slow
+   provider holds stock rows and pooled connections, and a crash after the charge leaves money taken for an order
+   that doesn't exist. Splitting it into order, payment and notification services fixes that but brings its own
+   problems: dual writes, duplicates, reordering, partial failure.
+2. **The plumbing that keeps the split correct.** Every service writes its outgoing messages to an outbox table in
+   the same transaction as its change, and a relay publishes them, confirmed and mandatory (at least once). Every
+   consumer records the message id in the handler's transaction, so a duplicate is skipped (effectively once). The
+   order service runs the payment saga as a pure transition function: success confirms, a decline cancels and
+   releases stock, and no answer by a deadline cancels and sends a refund, because "no answer" doesn't mean "not
+   charged". The payment service makes charge and refund commute, so their order doesn't matter. Failures retry
+   through wait queues with backoff, then dead-letter, and an operator replays them with `orderly.dead_letters`.
+3. **The proof.** 649 tests against real PostgreSQL and RabbitMQ: every saga state and input, Hypothesis sequences of
+   duplicated and reordered replies, consumer-driven contracts checked on both sides, the broker cut mid-run, every
+   message delivered twice. A 10,000-order load test checks the books order by order after every run.
+4. **The numbers.** At 100 orders/s the split costs about 3 ms at the median against the monolith (60.8 vs 58.0 ms end
+   to end) and cuts p99 from 135.6 to 78.5 ms, because no row lock is held across the provider call. Under 64
+   closed-loop clients it takes orders 2.75 times as fast as the monolith (359.4 vs 130.6/s) but charges only
+   171.0/s, so 2,769 of
+   10,000 timed out and were refunded: the monolith's slowness had been its backpressure. An opt-in cap on orders
+   awaiting payment brought that to 0. A broker restart now costs 0.2-0.4 s before orders settle again (2-3 s before
+   the day-4 fix).
+5. **What I'd do next.** The cap's number is picked by hand; it should come from the payment service's measured rate.
+   Dead letters are counted in `/health` but nothing pages anyone. One RabbitMQ node, so quorum queues don't fail over.
 
 ## The project
 
@@ -540,6 +568,72 @@ on the fixes found two more, both in those fixes: the recovery numbers would hav
 orders, and the proxy fix still missed a connection accepted in the same loop step as the cut. Round 2 finding bugs in
 round 1's fixes is the usual pattern, which is why there's a round 2.
 
+## Dead letters and the release (day 5)
+
+**What happens to a message no consumer can handle?**
+Two kinds end in `<queue>.dlq`: one refused at once (it doesn't decode, isn't the consumer's type, or names an order
+the service doesn't have) and one that failed every attempt (the first try and a retry after 1, 5 and 30 s). The
+service logs why, under the message id, and its `/health` counts its dead-letter queue (`dead_letters.waiting`) for an
+alert to read. Nothing consumes the dead-letter queue: an operator decides, with `python -m orderly.dead_letters`.
+
+**Why does a dead letter matter here?**
+The worst one is a `payment.refund` that failed four times because the provider's refunds were down: the order is
+cancelled and the customer is still charged. `tests/test_sagas_end_to_end.py`
+(`test_a_refund_dead_lettered_while_refunds_were_down_...`) builds exactly that, then replays the refund once refunds
+are back and checks the money returned.
+
+**How does a replay work?** (`src/orderly/dead_letters.py`, `run_pass`)
+One pass takes the dead letters one by one with `basic.get`, unacknowledged, and decides for each: keep, replay or
+discard. A replay publishes a copy to the work queue the message died in, through the default exchange with the queue's
+name as the routing key, so only that consumer sees it (republishing an event to its exchange would reach every
+subscriber again). Mandatory and confirmed; only then is the dead letter acknowledged. The kept ones are rejected with
+requeue at the end of the pass, so they stay.
+
+**Why strip the headers?**
+A dead letter carries the attempt number of its last try (4) and RabbitMQ's `x-death` history. The consumer reads the
+attempt header to decide whether a failure retries or dead-letters, so a replay that kept it would be dead-lettered by
+its first failure. The copy has no headers, so it starts again at attempt 1:
+`test_a_replay_after_the_cause_is_fixed_is_handled_once_with_its_attempts_restarted` fails it once after the replay and
+sees it retried, not dead-lettered.
+
+**What if the tool crashes halfway?**
+Between the broker's confirm and the acknowledgement, both the copy and the dead letter exist. Replaying again sends a
+second copy with the same message id, and the consumer's `processed_messages` makes it a duplicate. The first copy is
+handled because a dead-lettered message's id was never recorded (its handler's transaction rolled back). If the tool
+dies before it acknowledges anything, the broker gives every taken message back when the channel closes.
+
+**Which dead letters won't it replay?**
+One that doesn't decode, or whose type isn't routed to that queue: replaying it would only dead-letter it again. Those
+are kept, and `discard --id` removes them, by id only (there's no "discard everything").
+
+**Why read until the queue is empty instead of taking the count?**
+My first version took as many messages as the broker counted. A test that ran passes back to back saw the count one
+short: a quorum queue's count can lag the acknowledgements and requeues just sent (the day-2 smoke run saw the same
+lag in `list_queues`). `basic.get` until empty doesn't depend on it, and holding every taken message until the end means
+a pass never sees one twice.
+
+**Why not replay automatically?**
+A message is dead-lettered because something is wrong that retrying didn't fix. Replaying it before the cause is fixed
+just dead-letters it again. That decision needs a person, or at least a check that the cause is gone.
+
+**What is in v1.0.0?**
+Everything in the README's status: the monolith baseline, the three services, the outbox, idempotent consumers, the
+saga with compensations, retries and dead letters, the contracts, the failure injection, the load test, and the
+dead-letter tool. `CHANGELOG.md` lists it by day. The release's numbers are day 4's load test runs
+(`results/load/*.json`): day 5 changed no code on an order's path.
+
+## What went wrong on day 5
+
+- The tool's first listing test failed on its own assertion: an AMQP timestamp is whole seconds, and I compared the
+  copy's against the message's microseconds. The copy carries what the dead letter had.
+- The first version bounded a pass by the broker's count (above), and a count read right after a pass was one short.
+  I first added a wait for the count to catch up; the mutation check showed no test needed it (a `basic.get` sees the
+  requeued messages anyway), so it went, and the pass reads until the queue is empty.
+- Two consumer tests read the dead-letter queue as soon as the consumer counted a dead letter: the broker routes it a
+  moment after the reject (the same lesson as day 3). They wait for it now.
+- The lid closed at 21:32, a quarter of an hour into the session, and the Mac spent the rest of the evening in dark
+  wakes on battery, each command waiting for the next one. The load test wasn't re-run for the release.
+
 ## What went wrong on day 4
 
 - My first drain check in the load test read the books once both outboxes were empty and every order had its
@@ -582,7 +676,15 @@ round 1's fixes is the usual pattern, which is why there's a round 2.
 
 ## What's next
 
-Day 5: the release. README and WALKTHROUGH finished, the results gathered, `v1.0.0`. Carry-overs: no dead-letter
-replay tool (a dead-lettered refund leaves a customer charged until replayed), backpressure only opt-in (an overload
-becomes timeouts and refunds unless the opt-in cap is set, and its number is picked by hand), a stuck outbox row only
-reported, never parked; `wait_drained` and `books` have no unit test of their own.
+After `v1.0.0`, in the order I'd do them:
+
+- **Backpressure by measurement**: derive the awaiting cap from the payment service's measured settle rate and a
+  target wait, instead of a hand-picked number; or have the payment service scale out (its throughput is about 8 /
+  provider latency per instance).
+- **Alerting**: `/health` counts dead letters and failing outbox rows; something should page on them. The services
+  export no metrics yet.
+- **Park a stuck outbox row** after N attempts instead of retrying it forever, and give the dead-letter tool the
+  outbox's parked rows too.
+- **A RabbitMQ cluster**: quorum queues replicate only across nodes; the load test's outage stops the only one.
+- **Tests for the load test's drain and books** (`wait_drained`, `books`, `accepted_all`): day 4's round-2 review left
+  five surviving mutants there. They need the load databases and a broker; still open.

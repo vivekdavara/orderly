@@ -487,6 +487,7 @@ outbox never does) can't send two e-mails.
 | A broker drop under a consumer | It closes its channel for good and subscribes again (day 3) |
 | Orders arrive faster than they can be charged | With `ORDERLY_MAX_AWAITING_PAYMENT`, an order past the cap is a 503 with Retry-After, nothing written; without it, the backlog grows and the deadline cancels and refunds what it couldn't charge (day 4, measured) |
 | The provider takes the money and its answer is lost | The handler times out, the command is retried, the provider's idempotent answer confirms it; if every answer is lost, the deadline's void refunds it (day 4) |
+| A refund fails all its attempts (the provider's refunds down) | Dead-lettered: a cancelled order's customer stays charged, and the payment service's `/health` counts the dead letter. Once refunds are back, an operator replays it (`python -m orderly.dead_letters replay payment.commands --id ...`): a header-less copy to `payment.commands`, so its attempts start over (day 5, tested end to end) |
 
 ## Data
 
@@ -585,4 +586,4 @@ timeouts: 6,010 taken and settled, 3,990 turned away.
 | 2 | The monolith, the order service extracted from it, events through RabbitMQ, the transactional outbox |
 | 3 | The payment and notification services, the saga with compensations, idempotent consumers, dead letters, retries with backoff |
 | 4 | Contract tests, failure injection (broker down, duplicates), the 10,000-order load test |
-| 5 | README with results, WALKTHROUGH.md, v1.0.0 |
+| 5 | The dead-letter tool (list, replay, discard) and dead-letter counts in `/health`; README with results, WALKTHROUGH.md, CHANGELOG.md, v1.0.0 |

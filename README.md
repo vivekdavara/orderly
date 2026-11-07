@@ -8,14 +8,20 @@ the monolith.
 
 Python 3.11, FastAPI, RabbitMQ 4.3 (aio-pika), PostgreSQL 14 (psycopg 3), pytest. MIT licensed.
 
-**Status: day 4 of 5.** Day 1: the design, the message contracts, the RabbitMQ topology, the database schemas and
+**Status: day 5 of 5, the release.** Day 1: the design, the message contracts, the RabbitMQ topology, the database schemas and
 their migrations, the local RabbitMQ and PostgreSQL scripts, CI. Day 2: the monolith baseline, the order service
 extracted from it, and the transactional outbox with its relay. Day 3: the payment and notification services, the saga
 with its compensations (stock released, refunds, a deadline), idempotent consumers, retries through wait queues with
 backoff, and dead letters; an order now goes from `POST /orders` to its e-mail through all three services. Day 4:
 consumer-driven contract tests, failure injection (the broker cut mid-run, every message twice, a provider that loses
 its answers), the 10,000-order load test against the monolith, and a fix it found (the services sat idle for seconds
-after a broker restart). Day 5 is the release ([DESIGN.md](DESIGN.md) "Days").
+after a broker restart). Day 5: a tool to list, replay and discard dead letters (`python -m orderly.dead_letters`),
+each service's `/health` counting its dead letters, and the release ([CHANGELOG.md](CHANGELOG.md)).
+
+**Reading order**: this README's architecture and "Results (day 4)", then [WALKTHROUGH.md](WALKTHROUGH.md) "In two
+minutes", then [DESIGN.md](DESIGN.md) for the full specification. In the code: `saga.py` (the saga as a pure
+function), `ordering.py` and `orders.py` (taking an order, the saga's consumer and sweeper), `outbox.py`, `consumer.py`,
+`payments.py`, then `dead_letters.py`.
 
 ## Architecture
 
@@ -54,6 +60,7 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `src/orderly/payments.py` | The payment service (day 3): payment.commands applied one order at a time (advisory lock), the provider called in the transaction, a refund before any charge voiding at the provider; replies through its outbox |
 | `src/orderly/notifications.py` | The notification service (day 3): one e-mail per order and kind, retried, at least once |
 | `src/orderly/consumer.py` | The idempotent consumer every service uses (day 3): `processed_messages` in the handler's transaction, retries through the wait queues, dead letters, a stop that drains, resubscribing after a broker drop |
+| `src/orderly/dead_letters.py` | The dead-letter tool (day 5): list, replay (a header-less copy to the work queue it died in, confirmed before the dead letter is acknowledged) and discard by id; `python -m orderly.dead_letters` |
 | `src/orderly/outbox.py` | The transactional outbox: `write` in the change's transaction, `Relay` claiming in id order with `SKIP LOCKED`, publishing a batch, confirming, marking; LISTEN/NOTIFY wake-up |
 | `src/orderly/order_api.py` | `POST /orders` and `GET /orders/{id}`, the same for both apps |
 | `src/orderly/fakes.py`, `src/orderly/emails.py` | The deterministic fake payment provider (idempotent charges, refunds and voids by order id) and mailer; the two e-mails |
@@ -72,7 +79,7 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `scripts/load_test.py` | The 10,000-order load test (day 4): the monolith or the three services as processes, open or closed loop, end-to-end latency to the outcome event, the books checked; `--broker-outage` stops the node mid-run; `make load-test` |
 | `results/load/*.json` | The load test runs in the README, as the script wrote them (settings, summary, books) |
 | `tests/chaos.py`, `tests/shop.py` | A TCP proxy in front of RabbitMQ that tests cut and restore; the three services in one process for whole-saga tests |
-| `tests/` | 531 tests: unit, property and integration tests against the real servers, whole sagas through the three services |
+| `tests/` | 649 tests: unit, property and integration tests against the real servers, whole sagas through the three services |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
 ## Run it
@@ -122,6 +129,19 @@ sets one), `ORDERLY_TOPOLOGY_PREFIX` (none; the load test's own topology), `ORDE
 `ORDERLY_PROVIDER_LATENCY_MS`, `ORDERLY_PROVIDER_DECLINE_RATIO`, `ORDERLY_PROVIDER_ERROR_RATIO` (0), and the fake
 mailer's `ORDERLY_MAILER_LATENCY_MS`, `ORDERLY_MAILER_FAILURE_RATIO` (0).
 
+When a message is dead-lettered (refused, or failed on all four attempts), the service logs why under its id, and its
+`/health` counts it (`"dead_letters": {"queue": "payment.commands.dlq", "waiting": 1}`). Once the cause is fixed:
+
+```bash
+.venv/bin/python -m orderly.dead_letters list                       # every dead-letter queue, changing nothing
+.venv/bin/python -m orderly.dead_letters replay payment.commands --id <message id> --dry-run
+.venv/bin/python -m orderly.dead_letters replay payment.commands --all
+.venv/bin/python -m orderly.dead_letters discard payment.commands --id <message id>   # one that will never work
+```
+
+`--json` prints one object per dead letter; the exit status is 0 when everything asked for was done, 1 when a dead
+letter to replay or discard is still there (not found, can't be replayed, not confirmed), 2 for a bad command line.
+
 The scripts on their own:
 
 ```bash
@@ -136,8 +156,25 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 629 tests in about 2 minutes here (124-132 s for the pytest part on day 4; 120.5 s for day 3's
-516, 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 4's (98 new):
+`make check` runs 649 tests in about 2.5 minutes here (141.7-146.0 s for the pytest part on day 5; 124-132 s for day
+4's 629, 120.5 s for day 3's 516, 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 5's (20 new):
+
+- **The dead-letter tool** (17, `tests/test_dead_letters.py`, real RabbitMQ): a listing describes each dead letter (id,
+  type, order, last attempt, RabbitMQ's reason and time) and changes nothing; the reason is the last death's, not
+  `x-first-death-reason` (which says `expired` for anything that went through a wait queue); the replayed copy has the
+  original's body and properties and no headers; an undecodable dead letter and one whose type isn't routed to that
+  queue are kept, then discarded by id; only the chosen ids are replayed; a dry run changes nothing; a replay the broker
+  can't route keeps the dead letter; the limit; unknown queues refused; the routes equal each consumer's `ACCEPTS`; a
+  replay handled once by a real consumer with its attempts restarted (failed once more after the replay, it is retried,
+  not dead-lettered); a replay interrupted between the confirm and the acknowledgement, replayed again and skipped as a
+  duplicate; the command line's output, exit statuses and refusals; back-to-back passes each seeing everything.
+- **End to end** (1, `tests/test_sagas_end_to_end.py`): a charge outliving the order's deadline, a refund
+  dead-lettered while the provider's refunds are down (a cancelled order's customer charged), replayed once they are
+  back: refunded, net 0, one e-mail.
+- **`/health`** (2, `tests/test_service.py`): a dead letter counted while the status stays 200; the count unknown when
+  the broker connection is closed; each service's work queue as its module names it.
+
+Day 4's (98 new):
 
 - **Contracts** (68, `tests/test_contracts.py`, `contracts/*.json`): 11 interactions, each checked as a contract (well
   formed; the example a canonical message, valid by the published JSON Schema; routed to its consumer and in its
@@ -277,6 +314,20 @@ Tests that need a server find it at `ORDERLY_AMQP_URL` and `ORDERLY_TEST_DATABAS
 are skipped when it isn't there, except with `ORDERLY_REQUIRE_SERVICES=1` (CI sets it), where a missing server fails
 them. Each test isolates itself on the shared servers: a random prefix on every exchange and queue it declares, and a
 private schema in the test database.
+
+## Results at v1.0.0
+
+The release's numbers are day 4's runs below, not re-measured on day 5: day 5 added a separate tool and a count in
+`/health`, and changed nothing an order goes through. In one table (all from `results/load/*.json` and the outage
+samples, synthetic data, one laptop):
+
+| What | Monolith | Services |
+|---|---|---|
+| End to end at 100 orders/s, p50 / p99 | 58.0 / 135.6 ms | 60.8 / 78.5 ms (the POST answered in 3.4 ms at p50) |
+| 64 closed-loop clients: taken / settled per second | 130.6 / 130.6 | 359.4 / 171.0, and 2,769 of 10,000 timed out and refunded |
+| The same with the awaiting cap at 1,000 | | 0 timed out; 3,990 refused with 503; end-to-end p99 8.3 s |
+| Broker stopped for about 14 s at 100/s: first order settled after the restart | | 0.18 / 0.37 s (2.15 / 2.97 s before the day-4 fix) |
+| Orders lost, in every run | 0 | 0 (the books checked order by order) |
 
 ## Results (day 4)
 
@@ -637,13 +688,21 @@ connection and with the lock already held, `-1` really meaning no limit, cleanup
   503 rather than 429: the service is out of capacity for everyone, not limiting this client.
 - **Workers wake on the reconnect, not only on their backoff** (day 4): a backoff exists to spare a broker that's down,
   so once the connection is back there is nothing left to wait for.
+- **Dead letters replayed into the queue they died in, by hand** (day 5): through the default exchange, so a replayed
+  event reaches only the consumer that failed it, not every subscriber again; with no headers, so its attempts start
+  over; never automatically, because a message is dead-lettered when retrying didn't fix it, and replaying before the
+  cause is fixed only dead-letters it again.
+- **Dead letters counted in `/health`, never a 503** (day 5): the service is doing its job for every other message;
+  the count is for an alert, like the outbox's failing rows.
 
 ## Limitations
 
-- A dead-lettered message waits for an operator: there is no replay tool yet, and a dead-lettered `payment.refund`
-  (the provider failing all four attempts) leaves a cancelled order's customer charged until someone replays it. The
-  dead-letter queues have no alert either. A replay must reset `x-orderly-attempt` (a dead letter carries 4), or the
-  replayed message's first failure dead-letters it again.
+- A dead-lettered message waits for an operator: a dead-lettered `payment.refund` (the provider failing all four
+  attempts) leaves a cancelled order's customer charged until someone replays it with `orderly.dead_letters`. `/health`
+  counts the dead letters, but nothing here alerts on the count. Why each one died is in the service's log, not in the
+  message (a reject can't add headers).
+- The dead-letter tool holds every message it takes until the end of its pass (at most `--limit`, 1,000 by default),
+  so a pass over a very large dead-letter queue holds that many unacknowledged messages.
 - The confirmation e-mail is at least once: a crash between the send and the commit sends it again.
 - The payment service holds a database connection for each provider call in flight (8 at most per instance, the
   consumer's prefetch), so a slow provider limits its throughput to 8 / latency per instance: about 160 orders/s at
