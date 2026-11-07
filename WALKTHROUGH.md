@@ -20,7 +20,7 @@ The pitch, if asked to walk through the project end to end:
    releases stock, and no answer by a deadline cancels and sends a refund, because "no answer" doesn't mean "not
    charged". The payment service makes charge and refund commute, so their order doesn't matter. Failures retry
    through wait queues with backoff, then dead-letter, and an operator replays them with `orderly.dead_letters`.
-3. **The proof.** 649 tests against real PostgreSQL and RabbitMQ: every saga state and input, Hypothesis sequences of
+3. **The proof.** 666 tests against real PostgreSQL and RabbitMQ: every saga state and input, Hypothesis sequences of
    duplicated and reordered replies, consumer-driven contracts checked on both sides, the broker cut mid-run, every
    message delivered twice. A 10,000-order load test checks the books order by order after every run.
 4. **The numbers.** At 100 orders/s the split costs about 3 ms at the median against the monolith (60.8 vs 58.0 ms end
@@ -612,6 +612,17 @@ short: a quorum queue's count can lag the acknowledgements and requeues just sen
 lag in `list_queues`). `basic.get` until empty doesn't depend on it, and holding every taken message until the end means
 a pass never sees one twice.
 
+**What did the review find?** (README "Review of day 5")
+A dead letter with no id at all could never be removed: a producer other than aio-pika may set no `message_id`, the
+body didn't decode, and `discard` matches ids only. Such a dead letter is now named by its body's hash. From its
+suspicions: a pass that failed halfway now reports what it had done instead of a traceback, and `/health`'s count
+survives whatever the broker library raises.
+
+**What does "nothing lost" mean when the channel dies mid-replay?**
+`test_a_pass_whose_channel_closes_halfway_reports_what_it_had_done`: the second copy reached the work queue but its
+confirm never came back, so the tool kept its dead letter. Both exist: at-least-once, and the consumer's
+`processed_messages` turns the second delivery into a duplicate. The alternative (acknowledging first) can lose it.
+
 **Why not replay automatically?**
 A message is dead-lettered because something is wrong that retrying didn't fix. Replaying it before the cause is fixed
 just dead-letters it again. That decision needs a person, or at least a check that the cause is gone.
@@ -632,7 +643,10 @@ dead-letter tool. `CHANGELOG.md` lists it by day. The release's numbers are day 
 - Two consumer tests read the dead-letter queue as soon as the consumer counted a dead letter: the broker routes it a
   moment after the reject (the same lesson as day 3). They wait for it now.
 - The lid closed at 21:32, a quarter of an hour into the session, and the Mac spent the rest of the evening in dark
-  wakes on battery, each command waiting for the next one. The load test wasn't re-run for the release.
+  wakes on battery, each command waiting for the next one; the work finished the next morning. The load test wasn't
+  re-run for the release.
+- My halfway-failure test first expected one copy in the work queue and found two: the second copy had arrived though
+  its confirm was lost. That is the at-least-once case working; the test now says so.
 
 ## What went wrong on day 4
 
@@ -686,5 +700,5 @@ After `v1.0.0`, in the order I'd do them:
 - **Park a stuck outbox row** after N attempts instead of retrying it forever, and give the dead-letter tool the
   outbox's parked rows too.
 - **A RabbitMQ cluster**: quorum queues replicate only across nodes; the load test's outage stops the only one.
-- **Tests for the load test's drain and books** (`wait_drained`, `books`, `accepted_all`): day 4's round-2 review left
-  five surviving mutants there. They need the load databases and a broker; still open.
+- **Health that notices a frozen broker**: `/health` trusts an open connection; a heartbeat-based check would catch
+  a broker that stops answering.

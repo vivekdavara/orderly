@@ -79,7 +79,7 @@ choreography, the saga's states, the message table, the topology, the outbox, th
 | `scripts/load_test.py` | The 10,000-order load test (day 4): the monolith or the three services as processes, open or closed loop, end-to-end latency to the outcome event, the books checked; `--broker-outage` stops the node mid-run; `make load-test` |
 | `results/load/*.json` | The load test runs in the README, as the script wrote them (settings, summary, books) |
 | `tests/chaos.py`, `tests/shop.py` | A TCP proxy in front of RabbitMQ that tests cut and restore; the three services in one process for whole-saga tests |
-| `tests/` | 649 tests: unit, property and integration tests against the real servers, whole sagas through the three services |
+| `tests/` | 666 tests: unit, property and integration tests against the real servers, whole sagas through the three services |
 | `.github/workflows/ci.yml` | Lint, mypy --strict and the suite with PostgreSQL 14 and RabbitMQ 4.3 service containers |
 
 ## Run it
@@ -156,10 +156,11 @@ Erlang distribution (25673) and epmd to loopback.
 
 ## Tests
 
-`make check` runs 649 tests in about 2.5 minutes here (141.7-146.0 s for the pytest part on day 5; 124-132 s for day
-4's 629, 120.5 s for day 3's 516, 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 5's (20 new):
+`make check` runs 666 tests in about 2.5 minutes here (150.9 s for the pytest part at the last day-5 commit; 124-132 s
+for day 4's 629, 120.5 s for day 3's 516, 74.6 s for day 2's 366, 30.7 s for day 1's 231). Day 5's (37 new):
 
-- **The dead-letter tool** (17, `tests/test_dead_letters.py`, real RabbitMQ): a listing describes each dead letter (id,
+- **The dead-letter tool** (21, `tests/test_dead_letters.py` and the review's `tests/review_d5/`, real RabbitMQ): a
+  listing describes each dead letter (id,
   type, order, last attempt, RabbitMQ's reason and time) and changes nothing; the reason is the last death's, not
   `x-first-death-reason` (which says `expired` for anything that went through a wait queue); the replayed copy has the
   original's body and properties and no headers; an undecodable dead letter and one whose type isn't routed to that
@@ -167,12 +168,21 @@ Erlang distribution (25673) and epmd to loopback.
   can't route keeps the dead letter; the limit; unknown queues refused; the routes equal each consumer's `ACCEPTS`; a
   replay handled once by a real consumer with its attempts restarted (failed once more after the replay, it is retried,
   not dead-lettered); a replay interrupted between the confirm and the acknowledgement, replayed again and skipped as a
-  duplicate; the command line's output, exit statuses and refusals; back-to-back passes each seeing everything.
+  duplicate; the command line's output, exit statuses and refusals; back-to-back passes each seeing everything; a pass
+  over a missing queue, and one whose channel closes halfway, reporting what they did; a dead letter with no id at all
+  named by its body's hash, and discarded by it (the review's test, which failed 3 of 3 before).
 - **End to end** (1, `tests/test_sagas_end_to_end.py`): a charge outliving the order's deadline, a refund
   dead-lettered while the provider's refunds are down (a cancelled order's customer charged), replayed once they are
   back: refunded, net 0, one e-mail.
-- **`/health`** (2, `tests/test_service.py`): a dead letter counted while the status stays 200; the count unknown when
-  the broker connection is closed; each service's work queue as its module names it.
+- **`/health`** (4, `tests/test_service.py`): a dead letter counted while the status stays 200; the count unknown when
+  the broker connection is closed; each service's work queue as its module names it; a bare `Exception()` and a stray
+  `CancelledError` from the broker library leaving the count null, not breaking `/health`.
+- **The load test's drain and books** (11, `tests/test_load_test_books.py`): `wait_drained` and `books` against the
+  in-process services' databases (they read the load databases and a broker, so day 4 had no test for them): the books
+  agree with refused orders in the run, disagree with an accepted order missing, and disagree when two orders are wrong
+  in ways that keep every sum equal; the drain goes quiet on the accepted count and reports a timeout; the final
+  verdict needs a quiet drain and no dead letter; `drive`'s accepted count includes the warm-up and excludes the cap's
+  refusals. Day 4's five surviving mutants (M11-M15), re-applied, each fail them.
 
 Day 4's (98 new):
 
@@ -496,6 +506,28 @@ The second row is the day's most useful finding: on RabbitMQ 4, requeueing a mes
 so a consumer that requeues on a transient error would loop forever without the delivery limit ever stopping it. The
 retries (day 3) therefore never requeue: they go through wait queues with their own attempt count.
 
+## Review of day 5
+
+One review agent, in its own git worktree, read the day's code at `1c95349` (the dead-letter tool, the `/health`
+count; started 23:50, mostly in the Mac's dark wakes, asked to report at 00:46) with a correctness brief, and wrote its
+finding as a test. One defect, its test failing 3 of 3 before the fix and passing after:
+
+| Defect | Fix |
+|---|---|
+| A dead letter that didn't decode and had no AMQP `message_id` could never be removed: its id was the property, None for any producer that sets none (aio-pika always fills one in; pika, the Java and Go clients and the management UI don't), and `discard` matches ids only. It stayed for good, `/health`'s count never went back to 0 and every `replay --all` exited 1 | such a dead letter's id is `sha256:` and 16 hex digits of its body's hash, the same on every pass (`64ca5e4`, `tests/review_d5/`) |
+
+From its suspicions, two fixed: a pass that failed partway (a wrong prefix, the channel closed mid-pass) raised a
+traceback without printing what it had already done, acknowledged replays included; it now reports the failure with
+its outcomes and exits 1 (`64ca5e4`). And `/health`'s count caught only four exception types, so aiormq's bare
+`Exception()` or a stray `CancelledError` on a closing connection would have escaped as a 500 (`2d25e34`). Its
+mutation pass didn't run before it was asked to report; mine did, on ten lines (the body id, acknowledging before the
+publish, the copy keeping its headers, the first death's reason, any type replayable, a non-mandatory replay, discard
+ignoring the id, a failure exiting 0, and both health changes): all ten killed. Not acted on: a channel left open if
+`/health`'s 2 s timeout cancels the channel's open (unproven); a dead letter refused for an unknown order counts as
+replayable (by design: whether the order exists now is the operator's call; the docstring says so). What held: a
+broker that stops answering mid-`/health` gave a null count in 2.08 s without hanging; 30 counts against a missing
+queue left no channel open; the tool's at-least-once order (confirm, then acknowledge); the exit statuses.
+
 ## Review of day 4
 
 One review agent, in its own git worktree, read the day's code at `e2c03bf` (15:48-16:00, about 12 minutes, ~205k
@@ -703,6 +735,8 @@ connection and with the lock already held, `-1` really meaning no limit, cleanup
   message (a reject can't add headers).
 - The dead-letter tool holds every message it takes until the end of its pass (at most `--limit`, 1,000 by default),
   so a pass over a very large dead-letter queue holds that many unacknowledged messages.
+- `/health` answers 200 while the broker connection is open but the broker has stopped answering (the day-5 review saw
+  it with a frozen proxy): only a closed or reconnecting connection is a problem.
 - The confirmation e-mail is at least once: a crash between the send and the commit sends it again.
 - The payment service holds a database connection for each provider call in flight (8 at most per instance, the
   consumer's prefetch), so a slow provider limits its throughput to 8 / latency per instance: about 160 orders/s at

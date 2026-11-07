@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.0.0 (2026-11-06)
+## v1.0.0 (2026-11-07)
 
 The first release: an order-processing monolith and the three services split from it, with the plumbing that keeps the
 split correct and the measurements of what it costs. Built over five days; the README's "Review of day N" sections
@@ -15,6 +15,9 @@ say what each day's reviews found and fixed.
 - Each service's `/health` counts its dead-letter queue (`dead_letters.waiting`), never failing on it.
 - The case it exists for, end to end: a refund dead-lettered while the provider's refunds were down, replayed once they
   were back, the customer refunded.
+- From the day's review: a dead letter with no id at all is named by its body's hash (it could never be discarded); a
+  pass that fails halfway reports what it did; `/health`'s count survives whatever the broker library raises.
+- Tests for the load test's drain and books (day 4's surviving mutants).
 - README "Results at v1.0.0", WALKTHROUGH "In two minutes" and "Dead letters and the release".
 
 ### Day 4: contracts, failure injection, the load test
