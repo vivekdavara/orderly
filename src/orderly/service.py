@@ -64,6 +64,14 @@ BUILDERS = {
 log = logging.getLogger(__name__)
 
 
+def topology_from_environment() -> Topology:
+    """The topology under ORDERLY_TOPOLOGY_PREFIX (default none), refused if the prefix isn't plain."""
+    prefix = os.environ.get("ORDERLY_TOPOLOGY_PREFIX", "")
+    if not TOPOLOGY_PREFIX.fullmatch(prefix):
+        raise ValueError(f"ORDERLY_TOPOLOGY_PREFIX must be letters, digits, '.', '-' or '_', not {prefix!r}")
+    return Topology(prefix=prefix)
+
+
 @dataclass(frozen=True)
 class Settings:
     service: str
@@ -87,14 +95,11 @@ class Settings:
     def from_environment(cls, service: str) -> Settings:
         """ORDERLY_POOL_SIZE and ORDERLY_POOL_TIMEOUT_S override the pool's defaults. ORDERLY_TOPOLOGY_PREFIX puts every
         exchange and queue under a prefix (the load test runs its services on a topology of its own; default none)."""
-        prefix = os.environ.get("ORDERLY_TOPOLOGY_PREFIX", "")
-        if not TOPOLOGY_PREFIX.fullmatch(prefix):
-            raise ValueError(f"ORDERLY_TOPOLOGY_PREFIX must be letters, digits, '.', '-' or '_', not {prefix!r}")
         return cls(
             service=service,
             database_url=database_url(service),
             amqp_url=amqp_url(),
-            topology=Topology(prefix=prefix),
+            topology=topology_from_environment(),
             pool_size=int(os.environ.get("ORDERLY_POOL_SIZE", "10")),
             pool_timeout=float(os.environ.get("ORDERLY_POOL_TIMEOUT_S", "5")),
         )
