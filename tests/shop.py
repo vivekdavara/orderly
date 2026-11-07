@@ -120,3 +120,24 @@ class Unreliable:
     async def void(self, order_id: uuid.UUID, amount_cents: int, currency: str) -> tuple[Charge, Refund] | None:
         self._maybe_fail(order_id)
         return await self.inner.void(order_id, amount_cents, currency)
+
+
+@dataclass
+class RefundsDown:
+    """A provider whose refunds and voids fail while `down` (an outage of that endpoint alone); charges go through."""
+
+    inner: FakeProvider
+    down: bool = True
+
+    async def charge(self, order_id: uuid.UUID, customer_id: str, amount_cents: int, currency: str) -> Charge:
+        return await self.inner.charge(order_id, customer_id, amount_cents, currency)
+
+    async def refund(self, order_id: uuid.UUID, amount_cents: int, currency: str) -> Refund:
+        if self.down:
+            raise ProviderUnavailable(f"refunds are down ({order_id})")
+        return await self.inner.refund(order_id, amount_cents, currency)
+
+    async def void(self, order_id: uuid.UUID, amount_cents: int, currency: str) -> tuple[Charge, Refund] | None:
+        if self.down:
+            raise ProviderUnavailable(f"voids are down ({order_id})")
+        return await self.inner.void(order_id, amount_cents, currency)
