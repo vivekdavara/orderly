@@ -11,6 +11,13 @@ SERVICES = ("orders", "payments", "notifications", "monolith")
 WITHOUT_BROKER = frozenset({"monolith"})
 # The services that publish, through an outbox (the notification service only consumes).
 WITH_OUTBOX = frozenset({"orders", "payments"})
+# The work queue each service consumes (each module's QUEUE; a test checks they agree), whose dead letters its /health
+# counts.
+CONSUMES = {
+    "orders": "order.payment-events",
+    "payments": "payment.commands",
+    "notifications": "notification.order-events",
+}
 
 
 def database_url(service: str) -> str:

@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse
 from psycopg_pool import AsyncConnectionPool
 
 from orderly.broker import amqp_url, robust_url
-from orderly.config import SERVICES, WITH_OUTBOX, WITHOUT_BROKER, database_url
+from orderly.config import CONSUMES, SERVICES, WITH_OUTBOX, WITHOUT_BROKER, database_url
 from orderly.migrate import migrate, migrations
 from orderly.topology import Topology
 
@@ -183,6 +183,24 @@ async def _outbox_report(conn: psycopg.AsyncConnection[Any]) -> dict[str, Any]:
     }
 
 
+async def _dead_letter_report(broker: AbstractRobustConnection, topology: Topology, queue: str) -> dict[str, Any]:
+    """How many messages wait in the dead-letter queue of the work queue this service consumes (day 5): each is one the
+    service gave up on, waiting for an operator (`python -m orderly.dead_letters`). Information for an alert, like the
+    outbox's `failing`, never a 503: the service is doing its job for every other message. `waiting` is None when the
+    broker can't say (it is down, which is reported on its own). The broker's count can lag by a moment."""
+    name = topology.dead_letter_queue(queue)
+    waiting: int | None = None
+    if not broker.is_closed and broker.connected.is_set():
+        try:
+            async with asyncio.timeout(HEALTH_TIMEOUT), await broker.channel(publisher_confirms=False) as channel:
+                declared = await channel.declare_queue(name, passive=True)
+            result = declared.declaration_result
+            waiting = int(result.message_count or 0) if result is not None else None
+        except (TimeoutError, aio_pika.exceptions.AMQPError, ConnectionError, RuntimeError):
+            waiting = None
+    return {"queue": name, "waiting": waiting}
+
+
 def create_app(settings: Settings, *, router: APIRouter | None = None, workers: Sequence[Worker] = ()) -> FastAPI:
     if settings.service not in SERVICES:
         raise ValueError(f"unknown service {settings.service!r}")
@@ -241,6 +259,10 @@ def create_app(settings: Settings, *, router: APIRouter | None = None, workers: 
                     report["outbox"] = await _outbox_report(conn)
         except (TimeoutError, psycopg.Error) as error:
             problems["database"] = f"{type(error).__name__}: {error}" if str(error) else type(error).__name__
+        if resources.broker is not None and settings.service in CONSUMES:
+            report["dead_letters"] = await _dead_letter_report(
+                resources.broker, settings.topology, CONSUMES[settings.service]
+            )
         if resources.broker is None:
             pass
         elif resources.broker.is_closed:

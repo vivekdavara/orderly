@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
+import aio_pika
 import psycopg
 import psycopg.conninfo
 import pytest
+from aio_pika.abc import AbstractChannel
 from fastapi import APIRouter
 from helpers import running
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from orderly import service
 from orderly.broker import amqp_url, robust_url
+from orderly.config import CONSUMES
 from orderly.migrate import Migration, MigrationError, migrate, migrations
 from orderly.service import PORTS, Resources, Settings, create_app
 from orderly.topology import Topology
@@ -34,6 +38,8 @@ async def test_a_started_service_has_migrated_and_is_healthy(
         expected = {"service": service, "schema_expected": latest, "schema": latest, "status": "ok", "problems": {}}
         if service in ("orders", "payments"):  # the services with an outbox
             expected["outbox"] = {"unpublished": 0, "failing": 0, "oldest_seconds": None}
+        if service != "monolith":  # the services that consume
+            expected["dead_letters"] = {"queue": topology.dead_letter_queue(CONSUMES[service]), "waiting": 0}
         assert response.json() == expected
     with psycopg.connect(fresh_database) as conn:
         versions = conn.execute("SELECT version FROM schema_migrations ORDER BY 1").fetchall()
@@ -327,3 +333,41 @@ async def test_a_running_service_reconnects_every_second(fresh_database: str, to
     async with running(app):
         broker = app.state.resources.broker
         assert broker is not None and broker.reconnect_interval == 1.0
+
+
+def test_each_service_consumes_the_queue_its_health_counts() -> None:
+    from orderly import notifications, orders, payments
+
+    assert CONSUMES == {"orders": orders.QUEUE, "payments": payments.QUEUE, "notifications": notifications.QUEUE}
+
+
+async def test_health_counts_the_dead_letters_without_failing_on_them(
+    fresh_database: str, topology: Topology, channel: AbstractChannel
+) -> None:
+    """A dead letter is one message the service gave up on: reported for an alert, not a 503 (day 5). With the broker
+    gone the count is unknown, and the broker is the problem reported."""
+    app = create_app(settings(fresh_database, topology, "payments"))
+    async with running(app) as client:
+        await channel.default_exchange.publish(
+            aio_pika.Message(b"junk"), routing_key=topology.queue("payment.commands"), mandatory=True
+        )
+        work = await channel.get_queue(topology.queue("payment.commands"), ensure=False)
+        deadline = time.monotonic() + 5
+        while (incoming := await work.get(no_ack=False, fail=False)) is None:
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.01)
+        await incoming.reject(requeue=False)
+        dlq = topology.dead_letter_queue("payment.commands")
+        while (response := await client.get("/health")).json()["dead_letters"]["waiting"] != 1:
+            assert time.monotonic() < deadline, response.text
+            await asyncio.sleep(0.05)
+        assert response.status_code == 200
+        assert response.json()["dead_letters"] == {"queue": dlq, "waiting": 1}
+        resources: Resources = app.state.resources
+        assert resources.broker is not None
+        await resources.broker.close()
+        response = await client.get("/health")
+        assert response.status_code == 503
+        body = response.json()
+        assert body["dead_letters"] == {"queue": dlq, "waiting": None}
+        assert body["problems"] == {"broker": "connection closed"}
