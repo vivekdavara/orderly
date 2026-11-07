@@ -371,3 +371,24 @@ async def test_health_counts_the_dead_letters_without_failing_on_them(
         body = response.json()
         assert body["dead_letters"] == {"queue": dlq, "waiting": None}
         assert body["problems"] == {"broker": "connection closed"}
+
+
+@pytest.mark.parametrize("raised", [Exception(), asyncio.CancelledError()])
+async def test_health_answers_whatever_the_dead_letter_count_raises(
+    fresh_database: str, topology: Topology, monkeypatch: pytest.MonkeyPatch, raised: BaseException
+) -> None:
+    """aiormq fails a call on a connection closed without a reason with a bare Exception(), and raises CancelledError
+    into an RPC's caller when the connection closes: neither may escape /health as a 500 or a dropped request (day-5
+    review's suspicion). The count is unknown; the broker itself still looks connected, so the status is 200."""
+    app = create_app(settings(fresh_database, topology, "payments"))
+    async with running(app) as client:
+        resources: Resources = app.state.resources
+        assert resources.broker is not None
+
+        async def broken(*_: object, **__: object) -> object:
+            raise raised
+
+        monkeypatch.setattr(resources.broker, "channel", broken)
+        response = await client.get("/health")
+        assert response.status_code == 200, response.text
+        assert response.json()["dead_letters"]["waiting"] is None

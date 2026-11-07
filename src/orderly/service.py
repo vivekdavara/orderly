@@ -196,8 +196,16 @@ async def _dead_letter_report(broker: AbstractRobustConnection, topology: Topolo
                 declared = await channel.declare_queue(name, passive=True)
             result = declared.declaration_result
             waiting = int(result.message_count or 0) if result is not None else None
-        except (TimeoutError, aio_pika.exceptions.AMQPError, ConnectionError, RuntimeError):
-            waiting = None
+        except asyncio.CancelledError:
+            # aiormq raises CancelledError into an RPC's caller when the connection closes under it: only a real cancel
+            # of this request is one (day-5 review).
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+        except Exception as error:
+            # The count is information: whatever the broker library raises (aiormq's bare Exception() on a connection
+            # closed without a reason among it), /health still answers, and the broker's state is reported on its own.
+            log.debug("health: no dead-letter count for %s: %r", name, error)
     return {"queue": name, "waiting": waiting}
 
 
