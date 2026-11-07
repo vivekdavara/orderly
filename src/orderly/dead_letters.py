@@ -14,7 +14,14 @@ letter again is harmless: the consumer's `processed_messages` makes the second c
 handled, because a dead-lettered message's id was never recorded (its handler's transaction rolled back).
 
 Only a message that decodes and whose type is routed to that queue is replayed; any other would just be dead-lettered
-again, so it is kept, and can be discarded by its id.
+again, so it is kept, and can be discarded by its id. A message refused for naming an order the service doesn't have is
+replayable: whether that has changed is the operator's call. Every dead letter has an id to name it by: the envelope's,
+else the AMQP `message_id`, else (a producer that set none, which aio-pika never is but other clients can be) one made
+from its body, `sha256:<16 hex digits>`, the same on every pass (day-5 review).
+
+A pass that fails partway (the broker gone, the dead-letter queue missing) stops and says so, with what it had done by
+then: a replayed copy is confirmed before its outcome is recorded, and if the acknowledgement after it is lost the dead
+letter comes back, where replaying it again is harmless.
 
 One pass takes the dead-letter queue's messages one by one (`basic.get`, unacknowledged, until it is empty or `limit`
 have been taken), decides for each, and gives back the ones it keeps at the end (rejected with requeue; if the tool
@@ -36,6 +43,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import sys
 from collections.abc import Callable, Sequence
@@ -63,7 +71,7 @@ class DeadLetter:
     """What a dead letter is, read from its body and headers."""
 
     queue: str  # the work queue it died in (unprefixed)
-    message_id: str | None  # the envelope's id, or the AMQP property's if the body doesn't decode
+    message_id: str  # the envelope's id, else the AMQP property's, else `sha256:` and the body's hash (see message_key)
     type: str | None
     order_id: str | None  # the envelope's correlation id, which is always the order's id
     attempt: int  # the attempt that failed last: 1 if it was never retried, len(retry delays) + 1 if out of attempts
@@ -93,6 +101,15 @@ class Pass:
     outcomes: tuple[Outcome, ...]
     # The pass stopped at its limit with more dead letters still waiting.
     truncated: bool = False
+    # Why the pass stopped before the end, if it did (the outcomes are what it had done by then).
+    failure: str | None = None
+
+
+def message_key(incoming: AbstractIncomingMessage) -> str:
+    """The id of a dead letter that doesn't decode: its AMQP `message_id`, or one made from its body when the producer
+    set none, so that every dead letter can be named for `discard --id` (day-5 review: one with no id could never be
+    removed, and kept /health's count above 0 for good)."""
+    return incoming.message_id or f"sha256:{hashlib.sha256(incoming.body).hexdigest()[:16]}"
 
 
 def describe(topology: Topology, queue: str, incoming: AbstractIncomingMessage) -> DeadLetter:
@@ -108,7 +125,7 @@ def describe(topology: Topology, queue: str, incoming: AbstractIncomingMessage) 
     except InvalidMessage as error:
         return DeadLetter(
             queue=queue,
-            message_id=incoming.message_id,
+            message_id=message_key(incoming),
             type=incoming.type,
             order_id=incoming.correlation_id,
             attempt=attempt_of(incoming),
@@ -181,13 +198,15 @@ async def _pass(
     dry_run: bool,
 ) -> Pass:
     name = topology.dead_letter_queue(queue)
-    waiting = await _count(channel, name)
-    async with asyncio.timeout(CALL_TIMEOUT):
-        dlq = await channel.get_queue(name, ensure=False)
+    waiting = 0
     outcomes: list[Outcome] = []
     kept: list[AbstractIncomingMessage] = []
     truncated = False
+    failure: str | None = None
     try:
+        waiting = await _count(channel, name)
+        async with asyncio.timeout(CALL_TIMEOUT):
+            dlq = await channel.get_queue(name, ensure=False)
         while True:
             async with asyncio.timeout(CALL_TIMEOUT):
                 incoming = await dlq.get(no_ack=False, fail=False)
@@ -221,22 +240,34 @@ async def _pass(
                     kept.append(incoming)
                     outcomes.append(Outcome(letter, "kept", f"the replay wasn't confirmed: {error!r}"))
                     if channel.is_closed:
-                        break
+                        raise
                     continue
+                # Recorded before the acknowledgement: the copy is in the work queue whatever happens to the ack.
+                outcomes.append(Outcome(letter, "replayed"))
                 async with asyncio.timeout(CALL_TIMEOUT):
                     await incoming.ack()
-                outcomes.append(Outcome(letter, "replayed"))
             else:
                 async with asyncio.timeout(CALL_TIMEOUT):
                     await incoming.ack()
                 outcomes.append(Outcome(letter, "discarded"))
+    except asyncio.CancelledError as error:
+        # aiormq raises CancelledError into an RPC's caller when the connection closes (see consumer.Consumer.run):
+        # only a real cancel of this task ends it as one.
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+        failure = f"the pass stopped: the broker connection closed ({error!r})"
+    except Exception as error:
+        # The broker gone, the channel closed (a missing queue closes it), a call timing out, aiormq's bare Exception():
+        # stop, and report what was done.
+        failure = f"the pass stopped: {error!r}"
     finally:
         # Give the kept ones back now rather than when the channel closes (either way they stay in the queue).
         for incoming in kept:
             with contextlib.suppress(Exception):
                 async with asyncio.timeout(CALL_TIMEOUT):
                     await incoming.reject(requeue=True)
-    return Pass(queue, waiting, tuple(outcomes), truncated)
+    return Pass(queue, waiting, tuple(outcomes), truncated, failure)
 
 
 async def _count(channel: AbstractChannel, name: str) -> int:
@@ -253,7 +284,7 @@ def _line(outcome: Outcome) -> str:
     letter = outcome.letter
     died = letter.died_at.isoformat() if letter.died_at else "?"
     text = (
-        f"{outcome.action:9} {letter.message_id or '?'} {letter.type or '?'} order {letter.order_id or '?'}"
+        f"{outcome.action:9} {letter.message_id} {letter.type or '?'} order {letter.order_id or '?'}"
         f" attempt {letter.attempt} {letter.reason or '?'} at {died}"
     )
     notes = [note for note in (letter.problem and f"({letter.problem})", outcome.detail) if note]
@@ -316,7 +347,7 @@ async def main_async(argv: Sequence[str], connection: AbstractConnection, topolo
             return action if letter.message_id in ids else "keep"
 
         passes = [await run_pass(connection, topology, args.queue, decide, limit=args.limit, dry_run=args.dry_run)]
-        missing = sorted(ids - {o.letter.message_id for o in passes[0].outcomes if o.letter.message_id})
+        missing = sorted(ids - {o.letter.message_id for o in passes[0].outcomes})
         if missing:
             print(f"not found in {topology.dead_letter_queue(args.queue)}: {', '.join(missing)}", file=sys.stderr)
             status = 1
@@ -330,6 +361,9 @@ async def main_async(argv: Sequence[str], connection: AbstractConnection, topolo
             print(f"{topology.dead_letter_queue(done.queue)}: {done.waiting} waiting")
             for outcome in done.outcomes:
                 print(f"  {_line(outcome)}")
+        if done.failure:
+            print(f"{done.queue}: {done.failure}", file=sys.stderr)
+            status = 1
         if done.truncated:
             print(f"{done.queue}: stopped at --limit {args.limit}, more are waiting", file=sys.stderr)
             if args.command != "list":

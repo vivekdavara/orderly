@@ -4,6 +4,7 @@ is handled once, a dead letter that can't be replayed is kept, and the command l
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -18,7 +19,7 @@ import pytest
 from aio_pika.abc import AbstractChannel, AbstractConnection
 from psycopg_pool import AsyncConnectionPool
 
-from orderly import dead_letters, notifications, orders, payments
+from orderly import broker, dead_letters, notifications, orders, payments
 from orderly.broker import publish, to_amqp
 from orderly.consumer import Connection, Consumer
 from orderly.dead_letters import DeadLetter, Pass, main_async, run_pass
@@ -501,3 +502,75 @@ async def test_passes_one_after_another_see_what_the_last_one_kept(
 
 def test_a_pass_is_not_truncated_unless_it_says_so() -> None:
     assert not Pass(QUEUE, 5, ()).truncated
+
+
+async def test_a_pass_over_a_dead_letter_queue_that_does_not_exist_says_so(connection: AbstractConnection) -> None:
+    """A wrong ORDERLY_TOPOLOGY_PREFIX: the passive declare closes the channel with NOT_FOUND. The pass reports it
+    rather than raising, and the command line exits 1 with the reason (day-5 review: a traceback before)."""
+    nowhere = Topology(prefix=f"missing-{uuid.uuid4().hex[:12]}.")
+    done = await run_pass(connection, nowhere, QUEUE, keep)
+    assert done.outcomes == () and done.failure is not None and "NOT_FOUND" in done.failure
+    status, _, err = await cli(connection, nowhere, "list", QUEUE)
+    assert status == 1 and "the pass stopped" in err
+
+
+async def test_a_pass_whose_channel_closes_halfway_reports_what_it_had_done(
+    connection: AbstractConnection,
+    channel: AbstractChannel,
+    short_topology: Topology,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pass's channel closes while it replays the second of three: the first is reported replayed, the pass says it
+    stopped, and nothing is lost: all three dead letters but the first are back in the dead-letter queue. The second's
+    copy may have reached the work queue without its confirm (it did here): a duplicate its consumer skips by id."""
+    for _ in range(3):
+        await kill(channel, short_topology, to_amqp(charge()))
+    opened: list[AbstractChannel] = []
+    real_open = broker.open_channel
+
+    async def capture(connection: AbstractConnection) -> AbstractChannel:
+        opened.append(await real_open(connection))
+        return opened[-1]
+
+    monkeypatch.setattr(broker, "open_channel", capture)
+    seen: list[DeadLetter] = []
+    closing: list[asyncio.Future[None]] = []
+
+    def decide(letter: DeadLetter) -> dead_letters.Action:
+        seen.append(letter)
+        if len(seen) == 2:
+            closing.append(asyncio.ensure_future(opened[0].close()))
+        return "replay"
+
+    done = await run_pass(connection, short_topology, QUEUE, decide)
+    await asyncio.gather(*closing, return_exceptions=True)
+    assert done.failure is not None and "closed" in done.failure
+    first, *rest = done.outcomes
+    assert first.action == "replayed" and all(o.action == "kept" for o in rest)
+    await at_depth(channel, short_topology.dead_letter_queue(QUEUE), 2)
+    work = await channel.get_queue(short_topology.queue(QUEUE), ensure=False)
+    copies = []
+    while (incoming := await work.get(no_ack=True, fail=False)) is not None:
+        copies.append(incoming.message_id)
+    assert copies[0] == first.letter.message_id and set(copies[1:]) <= {seen[1].message_id}
+    status, out, _ = await cli(connection, short_topology, "replay", QUEUE, "--all")
+    assert status == 0 and sum(line.strip().startswith("replayed") for line in out) == 2
+
+
+async def test_every_dead_letter_has_an_id_the_command_line_accepts(
+    connection: AbstractConnection, channel: AbstractChannel, short_topology: Topology
+) -> None:
+    """Without a message id the id comes from the body: the same on every pass, and `discard --id` takes it."""
+    message = aio_pika.Message(b"no id at all")
+    message.message_id = None
+    await kill(channel, short_topology, message)
+    first = await run_pass(connection, short_topology, QUEUE, keep)
+    second = await run_pass(connection, short_topology, QUEUE, keep)
+    [letter] = [o.letter for o in first.outcomes]
+    expected = "sha256:" + hashlib.sha256(b"no id at all").hexdigest()[:16]
+    if letter.message_id != expected:  # aiormq filled one in on the way out: then that is the id
+        assert letter.message_id and not letter.message_id.startswith("sha256:")
+    assert second.outcomes[0].letter.message_id == letter.message_id
+    status, _, _ = await cli(connection, short_topology, "discard", QUEUE, "--id", letter.message_id)
+    assert status == 0
+    await at_depth(channel, short_topology.dead_letter_queue(QUEUE), 0)
