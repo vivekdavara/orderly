@@ -482,6 +482,14 @@ def books(run: Run) -> dict[str, Any]:
     return result
 
 
+def settle_books(result: dict[str, Any], quiet: bool, dead_lettered: dict[str, int]) -> None:
+    """The services' books count only if the run went quiet before the drain's timeout and nothing was dead-lettered: a
+    drain that timed out read the books mid-flight, and a dead letter is an order whose saga stopped (day-4 review)."""
+    result["quiet"] = quiet
+    result["dead_lettered"] = dead_lettered
+    result["ok"] = bool(result["ok"]) and quiet and not any(dead_lettered.values())
+
+
 def recovery(samples: list[tuple[float, float]], outage: dict[str, float]) -> dict[str, Any]:
     """How the services came back from --broker-outage, from (due, outcome_at) pairs in seconds since the first timed
     order (0 for no outcome) and the outage's times on the same clock. `started_at` is when scripts/rabbitmq.sh start
@@ -591,9 +599,7 @@ async def main() -> int:
         quiet, dead_lettered = await wait_drained(run, topology)
         run.books = books(run)
         if run.target == "services":
-            run.books["quiet"] = quiet
-            run.books["dead_lettered"] = dead_lettered
-            run.books["ok"] = run.books["ok"] and quiet and not any(dead_lettered.values())
+            settle_books(run.books, quiet, dead_lettered)
     finally:
         stop_processes(processes)
         if outcomes is not None:
